@@ -1,16 +1,21 @@
 """clients/kalshi_client.py - Async REST client for the Kalshi Trade API v2.
 
-Handles auth, pagination, retries with exponential backoff, and idempotency.
+Handles RSA auth (PKCS#1 v1.5 + SHA-256), pagination, retries with
+exponential backoff, and idempotency keys.
 """
-
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from config import config
 
@@ -19,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 class KalshiAPIError(Exception):
     """Raised when Kalshi API returns a non-2xx response."""
+
     def __init__(self, status: int, body: str) -> None:
         self.status = status
         self.body = body
@@ -42,44 +48,47 @@ class AsyncKalshiClient:
         self._api_key = api_key or config.kalshi_api_key
         self._api_secret = api_secret or config.kalshi_api_secret
         self._base_url = (base_url or config.kalshi_base_url).rstrip("/")
-        self._timeout = aiohttp.ClientTimeout(total=config.kalshi_timeout_seconds)
         self._session: Optional[aiohttp.ClientSession] = None
-        self._consecutive_failures = 0
-
-    # ------------------------------------------------------------------
-    # Context manager support
-    # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "AsyncKalshiClient":
-        await self.open()
+        self._session = aiohttp.ClientSession()
+        logger.info(
+            "AsyncKalshiClient session opened (base=%s)", self._base_url
+        )
         return self
 
-    async def __aexit__(self, *_: Any) -> None:
-        await self.close()
-
-    async def open(self) -> None:
-        """Create the underlying aiohttp session."""
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        self._session = aiohttp.ClientSession(
-            headers=headers,
-            timeout=self._timeout,
-        )
-        logger.info("AsyncKalshiClient session opened (base=%s)", self._base_url)
-
-    async def close(self) -> None:
-        """Close the underlying aiohttp session."""
-        if self._session and not self._session.closed:
+    async def __aexit__(self, *args: Any) -> None:
+        if self._session:
             await self._session.close()
-            logger.info("AsyncKalshiClient session closed.")
 
-    # ------------------------------------------------------------------
-    # Low-level request helpers
-    # ------------------------------------------------------------------
+    def _build_headers(self, method: str, path: str) -> Dict[str, str]:
+        """Build RSA-signed request headers for Kalshi API v2."""
+        timestamp = str(int(time.time() * 1000))
+        # Message to sign: timestamp + method + path (no query string)
+        msg_to_sign = f"{timestamp}{method.upper()}{path}"
+
+        try:
+            private_key = serialization.load_pem_private_key(
+                self._api_secret.encode(),
+                password=None,
+            )
+            signature = base64.b64encode(
+                private_key.sign(
+                    msg_to_sign.encode("utf-8"),
+                    padding.PKCS1v15(),
+                    hashes.SHA256(),
+                )
+            ).decode()
+        except Exception as exc:
+            logger.error("Failed to sign request: %s", exc)
+            raise
+
+        return {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self._api_key,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+        }
 
     async def _request(
         self,
@@ -88,44 +97,51 @@ class AsyncKalshiClient:
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        retries: int = 3,
     ) -> Any:
-        """Execute an HTTP request with exponential back-off retry."""
+        """Execute a signed HTTP request with retries and backoff."""
         if self._session is None:
-            raise RuntimeError("Session not open. Use 'async with AsyncKalshiClient()'.")
+            raise RuntimeError("Client session not started. Use async with.")
 
         url = f"{self._base_url}{path}"
-        for attempt in range(1, config.kalshi_max_retries + 1):
+        headers = self._build_headers(method, path)
+        if extra_headers:
+            headers.update(extra_headers)
+
+        for attempt in range(retries):
             try:
                 async with self._session.request(
                     method,
                     url,
+                    headers=headers,
                     params=params,
                     json=json,
-                    headers=extra_headers or {},
                 ) as resp:
                     body = await resp.text()
-                    if resp.status >= 400:
-                        raise KalshiAPIError(resp.status, body)
-                    self._consecutive_failures = 0
-                    return await resp.json(content_type=None)
+                    if resp.status == 200:
+                        return await resp.json(content_type=None)
+                    if resp.status == 429:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "Rate limited (429). Waiting %ds before retry %d/%d.",
+                            wait, attempt + 1, retries,
+                        )
+                        await asyncio.sleep(wait)
+                        # Rebuild headers with fresh timestamp for retry
+                        headers = self._build_headers(method, path)
+                        if extra_headers:
+                            headers.update(extra_headers)
+                        continue
+                    raise KalshiAPIError(resp.status, body)
             except KalshiAPIError:
                 raise
-            except Exception as exc:  # noqa: BLE001
-                self._consecutive_failures += 1
-                wait = 2 ** attempt
-                logger.warning(
-                    "Request failed (attempt %d/%d) %s %s: %s. Retrying in %ds.",
-                    attempt,
-                    config.kalshi_max_retries,
-                    method,
-                    url,
-                    exc,
-                    wait,
-                )
-                if attempt == config.kalshi_max_retries:
+            except Exception as exc:
+                if attempt == retries - 1:
                     raise
-                await asyncio.sleep(wait)
-        return None  # unreachable
+                await asyncio.sleep(2 ** attempt)
+                logger.warning("Request error on attempt %d: %s", attempt + 1, exc)
+
+        raise KalshiAPIError(429, "Max retries exceeded due to rate limiting.")
 
     # ------------------------------------------------------------------
     # Market endpoints
@@ -134,23 +150,27 @@ class AsyncKalshiClient:
     async def get_markets(
         self,
         status: str = "open",
-        limit: int = 100,
-        cursor: Optional[str] = None,
+        limit: int = 200,
     ) -> List[Dict[str, Any]]:
         """Fetch all open markets, handling pagination automatically."""
         markets: List[Dict[str, Any]] = []
-        params: Dict[str, Any] = {"status": status, "limit": limit}
-        if cursor:
-            params["cursor"] = cursor
+        cursor: Optional[str] = None
 
         while True:
+            params: Dict[str, Any] = {"status": status, "limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+
             data = await self._request("GET", "/markets", params=params)
             batch = data.get("markets", [])
             markets.extend(batch)
-            next_cursor = data.get("cursor")
-            if not next_cursor or len(batch) < limit:
+
+            cursor = data.get("cursor")
+            if not cursor or not batch:
                 break
-            params["cursor"] = next_cursor
+
+            # Respect rate limit: small delay between pagination calls
+            await asyncio.sleep(0.5)
 
         logger.debug("Fetched %d markets (status=%s).", len(markets), status)
         return markets
@@ -160,7 +180,7 @@ class AsyncKalshiClient:
         data = await self._request("GET", f"/markets/{ticker}")
         return data.get("market", data)
 
-    async def get_market_orderbook(
+    async def get_orderbook(
         self, ticker: str, depth: int = 10
     ) -> Dict[str, Any]:
         """Fetch the order book for a market."""
@@ -169,30 +189,57 @@ class AsyncKalshiClient:
         )
 
     # ------------------------------------------------------------------
+    # Portfolio endpoints
+    # ------------------------------------------------------------------
+
+    async def get_balance(self) -> Dict[str, Any]:
+        """Get account balance."""
+        return await self._request("GET", "/portfolio/balance")
+
+    async def get_positions(self) -> List[Dict[str, Any]]:
+        """Get all open positions."""
+        data = await self._request("GET", "/portfolio/positions")
+        return data.get("market_positions", [])
+
+    # ------------------------------------------------------------------
     # Order endpoints
     # ------------------------------------------------------------------
 
     async def place_order(
         self,
         ticker: str,
-        side: str,  # "yes" or "no"
-        action: str,  # "buy" or "sell"
+        side: str,
+        action: str,
         count: int,
         order_type: str = "limit",
-        yes_price: Optional[int] = None,  # cents 1–99
+        yes_price: Optional[int] = None,
         no_price: Optional[int] = None,
         idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Place an order on Kalshi.
+        """Place a new order.
 
-        An idempotency key is generated automatically if not provided,
-        preventing duplicate orders on retried requests.
+        Args:
+            ticker:          Market ticker (e.g. "INXY-23-B4.5T").
+            side:            "yes" or "no".
+            action:          "buy" or "sell".
+            count:           Number of contracts.
+            order_type:      "limit" or "market".
+            yes_price:       Limit price in cents for YES contracts.
+            no_price:        Limit price in cents for NO contracts.
+            idempotency_key: Optional dedup key; auto-generated if None.
+
+        Returns:
+            The order dict returned by Kalshi.
         """
         key = idempotency_key or str(uuid.uuid4())
+        logger.info(
+            "Placing order: ticker=%s side=%s action=%s count=%d type=%s key=%s",
+            ticker, side, action, count, order_type, key,
+        )
         payload: Dict[str, Any] = {
             "ticker": ticker,
-            "side": side,
             "action": action,
+            "side": side,
             "count": count,
             "type": order_type,
         }
@@ -201,10 +248,6 @@ class AsyncKalshiClient:
         if no_price is not None:
             payload["no_price"] = no_price
 
-        logger.info(
-            "Placing order: ticker=%s side=%s action=%s count=%d type=%s key=%s",
-            ticker, side, action, count, order_type, key,
-        )
         return await self._request(
             "POST",
             "/portfolio/orders",
@@ -212,11 +255,20 @@ class AsyncKalshiClient:
             extra_headers={"Idempotency-Key": key},
         )
 
-    async def get_portfolio_balance(self) -> Dict[str, Any]:
-        """Fetch the current portfolio cash balance."""
-        return await self._request("GET", "/portfolio/balance")
+    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Cancel an existing order."""
+        return await self._request("DELETE", f"/portfolio/orders/{order_id}")
 
-    async def get_positions(self) -> List[Dict[str, Any]]:
-        """Fetch all current positions."""
-        data = await self._request("GET", "/portfolio/positions")
-        return data.get("market_positions", [])
+    async def get_orders(
+        self,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch orders, optionally filtered by ticker and/or status."""
+        params: Dict[str, Any] = {}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        data = await self._request("GET", "/portfolio/orders", params=params)
+        return data.get("orders", [])
