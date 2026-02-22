@@ -85,7 +85,7 @@ class MarketScanner:
             logger.error("MarketScanner.scan - API error: %s", exc)
             return []
 
-        candidates = [m for m in markets if self._passes_filters(m)]
+        candidates = [             m             for m in markets             if self._passes_filters(m)             and (category is None or getattr(m, "category", None) == category)         ]
         candidates.sort(
             key=lambda m: getattr(m, "open_interest", 0) or 0,
             reverse=True,
