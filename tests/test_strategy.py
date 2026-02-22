@@ -1,7 +1,7 @@
 """Tests for trading strategy logic."""
-import pytest
-import asyncio
-from unittest.mock import MagicMock, AsyncMock, patch
+
+
+from unittest.mock import MagicMock
 from app.strategy import (
     evaluate_market,
     score_market,
