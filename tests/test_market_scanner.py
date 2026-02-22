@@ -1,9 +1,8 @@
 """Tests for market scanner / filter logic."""
 import pytest
-import asyncio
-from unittest.mock import MagicMock, AsyncMock, patch
-from app.market_scanner import MarketScanner
 
+from unittest.mock import MagicMock, AsyncMock
+from app.market_scanner import MarketScanner
 
 def make_market(
     ticker="TEST-MARKET",
