@@ -1,23 +1,25 @@
 """app/main.py - EventTradingBot: the main async orchestrator.
 
 Starts two concurrent tasks:
-  1. ingest_loop  - polls Kalshi for market snapshots every N seconds
-  2. decision_loop - runs model + decision engine every M seconds
-"""
+  1. ingest_loop   - uses MarketScanner to poll Kalshi for active markets every N seconds
+  2. decision_loop - runs strategy.evaluate_market + executor every M seconds
 
+Position tracking prevents doubling up on the same market.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import signal
 import sys
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional, Set
 
+from app.market_scanner import MarketScanner
+from app.strategy import evaluate_market
 from clients.kalshi_client import AsyncKalshiClient
 from config import config
 from executor.trade_executor import TradeExecutor
-from model.example_model import ExampleHeuristicModel
-from model.interface import PredictionModel
 from monitoring.metrics import BotMetrics
 from storage.async_db_store import AsyncPostgresStore
 
@@ -36,42 +38,49 @@ logger = logging.getLogger(__name__)
 class EventTradingBot:
     """Top-level bot orchestrator.
 
-    Wires together the Kalshi client, prediction model, trade executor,
-    Postgres storage, and Prometheus metrics into a single async runtime.
+    Wires together:
+      - AsyncKalshiClient  : fetches live market data
+      - MarketScanner      : filters to only liquid, well-priced markets
+      - strategy module    : scores each market and decides YES/NO direction
+      - TradeExecutor      : routes to PAPER or LIVE with circuit breakers
+      - AsyncPostgresStore : logs every trade and snapshot to Postgres
+      - BotMetrics         : Prometheus counters / gauges
     """
 
-    def __init__(self, model: PredictionModel | None = None) -> None:
-        self._model = model or ExampleHeuristicModel()
+    def __init__(self) -> None:
         self._client = AsyncKalshiClient()
+        self._scanner = MarketScanner(self._client)
         self._store = AsyncPostgresStore()
-        self._executor: TradeExecutor | None = None
+        self._executor: Optional[TradeExecutor] = None
         self._metrics = BotMetrics()
         self._running = False
+
+        # Latest raw snapshots keyed by ticker
         self._latest_snapshots: Dict[str, Dict[str, Any]] = {}
+
+        # Position tracking: tickers we already hold a position in
+        self._open_positions: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def startup(self) -> None:
-        """Open connections and warm up the model."""
+        """Open connections, warm up."""
         config.validate()
         await self._client.open()
         await self._store.connect()
         self._executor = TradeExecutor(self._client)
-        self._model.warm_up()
         self._metrics.start_server()
         self._running = True
         logger.info(
-            "EventTradingBot started | mode=%s model=%s",
+            "EventTradingBot started | mode=%s",
             config.mode.value,
-            self._model.name,
         )
 
     async def shutdown(self) -> None:
         """Gracefully close all resources."""
         self._running = False
-        self._model.tear_down()
         await self._client.close()
         await self._store.close()
         logger.info("EventTradingBot shut down.")
@@ -83,6 +92,7 @@ class EventTradingBot:
             await asyncio.gather(
                 self._ingest_loop(),
                 self._decision_loop(),
+                self._position_sync_loop(),
             )
         except asyncio.CancelledError:
             logger.info("Bot tasks cancelled.")
@@ -94,29 +104,28 @@ class EventTradingBot:
     # ------------------------------------------------------------------
 
     async def _ingest_loop(self) -> None:
-        """Poll open markets and store snapshots at high frequency."""
+        """Use MarketScanner to fetch liquid active markets and cache snapshots."""
         while self._running:
             try:
-                markets: List[Dict[str, Any]] = await self._client.get_markets(
-                    status="open", limit=200
+                t0 = time.monotonic()
+                markets: List[Dict[str, Any]] = await self._scanner.scan(
+                    status="active"
                 )
                 for market in markets:
                     ticker = market.get("ticker", "")
                     if not ticker:
                         continue
-                    snapshot = {
-                        "ticker": ticker,
-                        "yes_bid": market.get("yes_bid", 0),
-                        "yes_ask": market.get("yes_ask", 0),
-                        "last_price": market.get("last_price", 0),
-                        "volume": market.get("volume", 0),
-                        "open_interest": market.get("open_interest", 0),
-                        "status": market.get("status", ""),
-                    }
+                    snapshot = self._scanner.to_snapshot(market)
                     self._latest_snapshots[ticker] = snapshot
                     await self._store.log_market_snapshot(ticker, snapshot)
+
+                elapsed = time.monotonic() - t0
                 self._metrics.markets_ingested.set(len(markets))
-                logger.debug("Ingest: %d open markets cached.", len(markets))
+                logger.debug(
+                    "Ingest: %d active markets cached in %.2fs.",
+                    len(markets),
+                    elapsed,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Ingest loop error: %s", exc)
                 await self._store.log_error("ingest_loop", str(exc))
@@ -125,79 +134,98 @@ class EventTradingBot:
             await asyncio.sleep(config.market_snapshot_interval)
 
     # ------------------------------------------------------------------
+    # Position sync loop - keeps _open_positions current
+    # ------------------------------------------------------------------
+
+    async def _position_sync_loop(self) -> None:
+        """Periodically refresh open positions from Kalshi.
+
+        Prevents us from doubling up on markets we already hold.
+        Runs every 60 seconds (same cadence as the decision loop).
+        """
+        while self._running:
+            await asyncio.sleep(config.decision_loop_interval)
+            try:
+                positions = await self._client.get_positions()
+                self._open_positions = {
+                    p.get("ticker", "") for p in positions
+                    if p.get("position", 0) != 0
+                }
+                logger.debug(
+                    "Position sync: %d open positions.",
+                    len(self._open_positions),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Position sync failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Decision loop - slower ticker (every M seconds)
     # ------------------------------------------------------------------
 
     async def _decision_loop(self) -> None:
-        """Run the model on every snapshot and execute trades if edge found."""
+        """Run strategy.evaluate_market on every snapshot, execute if signal found."""
         while self._running:
             await asyncio.sleep(config.decision_loop_interval)
+
             if not self._latest_snapshots:
                 logger.debug("Decision loop: no snapshots yet, waiting.")
                 continue
 
             for ticker, snapshot in list(self._latest_snapshots.items()):
-                await self._evaluate_market(ticker, snapshot)
+                await self._evaluate_and_trade(ticker, snapshot)
 
-    async def _evaluate_market(
+    async def _evaluate_and_trade(
         self, ticker: str, snapshot: Dict[str, Any]
     ) -> None:
-        """Run model on a single market and execute if criteria are met."""
-        event: Dict[str, Any] = {"id": ticker, "ticker": ticker}
-
-        try:
-            import time
-            t0 = time.monotonic()
-            prediction = self._model.predict(event, snapshot)
-            latency = time.monotonic() - t0
-            self._metrics.model_latency.observe(latency)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Model predict failed for %s: %s", ticker, exc)
+        """Run strategy on one snapshot and execute if a signal is generated."""
+        # Skip if we already hold a position in this market
+        if ticker in self._open_positions:
+            logger.debug("Skipping %s - already have an open position.", ticker)
             return
 
-        probability: float = prediction.get("probability", 0.5)
-        confidence: float = prediction.get("confidence", 0.0)
+        # Run the strategy
+        try:
+            signal = evaluate_market(snapshot)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Strategy error for %s: %s", ticker, exc)
+            return
 
-        yes_bid: float = float(snapshot.get("yes_bid", 50)) / 100.0
-        yes_ask: float = float(snapshot.get("yes_ask", 50)) / 100.0
-        implied_prob = (yes_bid + yes_ask) / 2.0
-        edge = probability - implied_prob
+        if signal is None:
+            return
 
-        await self._store.log_model_output(
-            ticker=ticker,
-            model_name=self._model.name,
-            probability=probability,
-            confidence=confidence,
-            implied_prob=implied_prob,
+        score: float = signal.get("score", 0.0)
+        side: str = signal.get("side", "yes")
+        action: str = signal.get("action", "buy")
+        yes_price: int = int(signal.get("yes_price", 0))
+
+        if yes_price <= 0 or yes_price >= 100:
+            return
+
+        logger.info(
+            "SIGNAL: %s | side=%s action=%s price=%d score=%.3f",
+            ticker,
+            side,
+            action,
+            yes_price,
+            score,
         )
 
-        # --- Decision rule: buy YES if edge > threshold and confidence > min ---
-        if edge > config.min_edge_threshold and confidence >= config.min_confidence:
-            yes_price_cents = int(yes_ask * 100)  # pay the ask
-            if yes_price_cents <= 0 or yes_price_cents >= 100:
-                return
+        assert self._executor is not None
+        record = await self._executor.execute(
+            ticker=ticker,
+            side=side,
+            action=action,
+            count=1,
+            yes_price=yes_price,
+            notes=f"score={score:.4f}",
+        )
 
-            logger.info(
-                "SIGNAL: %s | model=%.3f implied=%.3f edge=%.3f conf=%.3f -> BUY YES @ %d",
-                ticker, probability, implied_prob, edge, confidence, yes_price_cents,
-            )
-
-            record = await self._executor.execute(
-                ticker=ticker,
-                side="yes",
-                action="buy",
-                count=1,
-                yes_price=yes_price_cents,
-                model_probability=probability,
-                model_confidence=confidence,
-                implied_probability=implied_prob,
-                notes=f"edge={edge:.4f}",
-            )
-
-            if record:
-                await self._store.log_trade(record)
-                self._metrics.orders_placed.inc()
-                logger.info("Order logged: %s", record.id)
+        if record:
+            await self._store.log_trade(record)
+            self._metrics.orders_placed.inc()
+            # Optimistically add to open positions until next sync
+            self._open_positions.add(ticker)
+            logger.info("Order logged: %s | %s", record.id, ticker)
 
 
 # ---------------------------------------------------------------------------
