@@ -43,13 +43,13 @@ class AsyncKalshiClient:
 
     async def get_markets(
         self,
-        status: str = "open",
+        status: str = "active",
         limit: int = 200,
         category: Optional[str] = None,
         **kwargs: Any,
     ) -> List[Any]:
         path = "/markets"
-        params: Dict[str, Any] = {"status": status, "limit": limit}
+        params: Dict[str, Any] = {"limit": limit}
         if category:
             params["category"] = category
         headers = self._sign("GET", path)
