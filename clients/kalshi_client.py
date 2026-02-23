@@ -48,17 +48,34 @@ class AsyncKalshiClient:
         category: Optional[str] = None,
         **kwargs: Any,
     ) -> List[Any]:
-        path = "/markets"
-        params: Dict[str, Any] = {"limit": limit}
+        """Fetch markets via /events with nested markets for real volume data."""
+        path = "/events"
+        params: Dict[str, Any] = {
+            "limit": min(limit, 200),
+            "with_nested_markets": "true",
+        }
         if category:
             params["category"] = category
         headers = self._sign("GET", path)
         resp = await self._client.get(path, params=params, headers=headers)
         resp.raise_for_status()
         data = resp.json()
-        markets = data.get("markets", [])
-        logger.info("Fetched %d markets from Kalshi.", len(markets))
-        return markets
+        events = data.get("events", [])
+
+        # Flatten nested markets and attach category from parent event
+        all_markets: List[Any] = []
+        for event in events:
+            cat = event.get("category", "")
+            for market in event.get("markets", []):
+                market["category"] = cat
+                all_markets.append(market)
+
+        logger.info(
+            "Fetched %d events → %d markets from Kalshi.",
+            len(events),
+            len(all_markets),
+        )
+        return all_markets
 
     async def close(self) -> None:
         await self._client.aclose()
