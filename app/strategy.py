@@ -9,6 +9,7 @@ Design goals
 * Score is a float in [0.0, 1.0]; higher == stronger trade signal.
 * is_tradeable(score) takes a numeric score and compares to SCORE_THRESHOLD.
 * evaluate_market is the main entry-point for main.py.
+* Supports both dict markets (from API) and object markets.
 """
 from __future__ import annotations
 
@@ -23,6 +24,16 @@ MIN_OPEN_INTEREST: int = 100   # open positions
 MAX_SPREAD_CENTS: int = 20     # yes_ask - yes_bid spread ceiling
 UNDERPRICED_THRESHOLD: float = 0.30  # if yes_bid < 30 cents: underpriced YES
 OVERPRICED_THRESHOLD: float = 0.70   # if yes_bid > 70 cents: overpriced YES
+
+
+# ---------------------------------------------------------------------------
+# Helper: works with both dict markets and object markets
+# ---------------------------------------------------------------------------
+def _get(market: Any, key: str, default: Any = None) -> Any:
+    """Get attribute from a dict or object market."""
+    if isinstance(market, dict):
+        return market.get(key, default)
+    return getattr(market, key, default)
 
 
 # ---------------------------------------------------------------------------
@@ -41,16 +52,17 @@ def score_market(market: Any) -> float:
     Parameters
     ----------
     market:
-        Any object exposing .volume, .open_interest, .yes_bid, .yes_ask.
+        Any object or dict with volume/volume_24h, open_interest,
+        yes_bid, yes_ask fields.
 
     Returns
     -------
     float score in [0.0, 1.0].
     """
-    volume = getattr(market, "volume", 0) or 0
-    open_interest = getattr(market, "open_interest", 0) or 0
-    yes_bid = getattr(market, "yes_bid", 0) or 0
-    yes_ask = getattr(market, "yes_ask", 0) or 0
+    volume = _get(market, "volume_24h") or _get(market, "volume", 0) or 0
+    open_interest = _get(market, "open_interest", 0) or 0
+    yes_bid = _get(market, "yes_bid", 0) or 0
+    yes_ask = _get(market, "yes_ask", 0) or 0
 
     # --- Liquidity score (0-40) ---
     vol_score = min(20, int(volume / 500))          # 10k volume -> 20 pts
@@ -93,9 +105,9 @@ def is_tradeable(score: float) -> bool:
 
     Returns
     -------
-    bool - True only when score > SCORE_THRESHOLD.
+    bool - True only when score >= SCORE_THRESHOLD.
     """
-    return score > SCORE_THRESHOLD
+    return score >= SCORE_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -107,25 +119,25 @@ def evaluate_market(market: Any) -> Optional[Dict[str, Any]]:
     Pipeline:
     1. Basic status/volume checks.
     2. Score via score_market().
-    3. If score > SCORE_THRESHOLD, build and return a signal dict.
+    3. If score >= SCORE_THRESHOLD, build and return a signal dict.
 
     Parameters
     ----------
     market:
-        Market object with .ticker, .status, .volume, .open_interest,
-        .yes_bid, .yes_ask attributes.
+        Market dict or object with ticker, status, volume/volume_24h,
+        open_interest, yes_bid, yes_ask.
 
     Returns
     -------
     Dict with keys {ticker, action, side, yes_price, score} or None.
     """
-    # Hard gate: market must be open with sufficient volume
-    status = getattr(market, "status", None)
-    if status != "open":
+    # Hard gate: market must be active (Kalshi API returns 'active', not 'open')
+    status = _get(market, "status", None)
+    if status not in ("active", "open"):  # accept both for safety
         return None
 
-    volume = getattr(market, "volume", 0) or 0
-    open_interest = getattr(market, "open_interest", 0) or 0
+    volume = _get(market, "volume_24h") or _get(market, "volume", 0) or 0
+    open_interest = _get(market, "open_interest", 0) or 0
     if volume <= 0 or open_interest <= 0:
         return None
 
@@ -133,9 +145,9 @@ def evaluate_market(market: Any) -> Optional[Dict[str, Any]]:
     if not is_tradeable(score):
         return None
 
-    yes_bid = getattr(market, "yes_bid", 0) or 0
-    yes_ask = getattr(market, "yes_ask", 0) or 0
-    ticker = getattr(market, "ticker", "")
+    yes_bid = _get(market, "yes_bid", 0) or 0
+    yes_ask = _get(market, "yes_ask", 0) or 0
+    ticker = _get(market, "ticker", "")
 
     # Determine direction: buy YES when underpriced, buy NO when overpriced
     mid = (yes_bid + yes_ask) / 2.0 if (yes_bid and yes_ask) else yes_bid
