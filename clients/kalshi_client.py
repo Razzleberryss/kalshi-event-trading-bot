@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -31,6 +32,23 @@ class AsyncKalshiClient:
         )
         self._client = httpx.AsyncClient(base_url=KALSHI_API_BASE, timeout=10.0)
 
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def open(self) -> None:
+        """No-op lifecycle hook — client is ready after __init__."""
+        logger.debug("AsyncKalshiClient.open() called (no-op).")
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
+        logger.debug("AsyncKalshiClient closed.")
+
+    # ------------------------------------------------------------------
+    # Auth
+    # ------------------------------------------------------------------
+
     def _sign(self, method: str, path: str) -> Dict[str, str]:
         ts = str(int(time.time() * 1000))
         msg = (ts + method.upper() + path).encode()
@@ -40,6 +58,10 @@ class AsyncKalshiClient:
             "KALSHI-ACCESS-TIMESTAMP": ts,
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
         }
+
+    # ------------------------------------------------------------------
+    # Market data
+    # ------------------------------------------------------------------
 
     async def get_markets(
         self,
@@ -56,10 +78,12 @@ class AsyncKalshiClient:
         }
         if category:
             params["category"] = category
+
         headers = self._sign("GET", path)
         resp = await self._client.get(path, params=params, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+
         events = data.get("events", [])
 
         # Flatten nested markets and attach category from parent event
@@ -71,11 +95,114 @@ class AsyncKalshiClient:
                 all_markets.append(market)
 
         logger.info(
-            "Fetched %d events → %d markets from Kalshi.",
+            "Fetched %d events -> %d markets from Kalshi.",
             len(events),
             len(all_markets),
         )
         return all_markets
 
-    async def close(self) -> None:
-        await self._client.aclose()
+    async def get_positions(self) -> List[Dict[str, Any]]:
+        """Fetch current open positions for the account."""
+        path = "/portfolio/positions"
+        headers = self._sign("GET", path)
+        resp = await self._client.get(path, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("market_positions", [])
+
+    async def get_balance(self) -> Dict[str, Any]:
+        """Fetch current account balance."""
+        path = "/portfolio/balance"
+        headers = self._sign("GET", path)
+        resp = await self._client.get(path, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Order management
+    # ------------------------------------------------------------------
+
+    async def place_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        yes_price: int,
+        order_type: str = "limit",
+        client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Place an order on the Kalshi exchange.
+
+        Parameters
+        ----------
+        ticker : str
+            Market ticker (e.g. 'KXBTCD-25FEB2314-T65000').
+        side : str
+            'yes' or 'no'.
+        action : str
+            'buy' or 'sell'.
+        count : int
+            Number of contracts.
+        yes_price : int
+            Limit price in cents on the yes side (1-99).
+        order_type : str
+            'limit' (default) or 'market'.
+        client_order_id : str, optional
+            Idempotency key; auto-generated if not provided.
+
+        Returns
+        -------
+        dict containing the Kalshi order response.
+        """
+        path = "/portfolio/orders"
+        body: Dict[str, Any] = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": count,
+            "type": order_type,
+            "yes_price": yes_price,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+        }
+        headers = self._sign("POST", path)
+        headers["Content-Type"] = "application/json"
+        resp = await self._client.post(path, json=body, headers=headers)
+        resp.raise_for_status()
+        data: Dict[str, Any] = resp.json()
+        logger.info(
+            "Order placed: %s %s %s x%d @ %d -> order_id=%s",
+            action,
+            side,
+            ticker,
+            count,
+            yes_price,
+            data.get("order", {}).get("id", "?"),
+        )
+        return data
+
+    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Cancel an open order by order_id."""
+        path = f"/portfolio/orders/{order_id}"
+        headers = self._sign("DELETE", path)
+        resp = await self._client.delete(path, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_orders(
+        self,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Fetch the account's orders, optionally filtered."""
+        path = "/portfolio/orders"
+        params: Dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        headers = self._sign("GET", path)
+        resp = await self._client.get(path, params=params, headers=headers)
+        resp.raise_for_status()
+        return resp.json().get("orders", [])
