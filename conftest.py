@@ -14,7 +14,6 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -28,9 +27,62 @@ def mock_client() -> AsyncMock:
     client = AsyncMock()
     client.get_markets = AsyncMock(return_value=[])
     client.place_order = AsyncMock(return_value={"order_id": "test-order-123"})
-    client.get_portfolio = AsyncMock(return_value={"balance": 10_000})
+    client.get_positions = AsyncMock(return_value=[])
+    client.get_balance = AsyncMock(return_value={"balance": 10_000})
+    client.get_orders = AsyncMock(return_value=[])
+    client.cancel_order = AsyncMock(return_value={"status": "cancelled"})
     return client
 
+
+# ---------------------------------------------------------------------------
+# Dict-based market fixtures (matches Kalshi /events API response format)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def liquid_dict_market() -> dict:
+    """A dict market as returned by the Kalshi /events API."""
+    return {
+        "ticker": "LIQUID-MARKET",
+        "status": "active",
+        "yes_bid": 45,
+        "yes_ask": 55,
+        "volume_24h": 10_000,
+        "open_interest": 500,
+        "category": "Economics",
+    }
+
+
+@pytest.fixture
+def closed_dict_market() -> dict:
+    """A dict market that is closed (should be filtered out by scanner)."""
+    return {
+        "ticker": "CLOSED-MARKET",
+        "status": "closed",
+        "yes_bid": 45,
+        "yes_ask": 55,
+        "volume_24h": 10_000,
+        "open_interest": 500,
+        "category": "Economics",
+    }
+
+
+@pytest.fixture
+def low_volume_dict_market() -> dict:
+    """A dict market with insufficient volume (should be filtered out)."""
+    return {
+        "ticker": "ILLIQUID-MARKET",
+        "status": "active",
+        "yes_bid": 45,
+        "yes_ask": 55,
+        "volume_24h": 5,
+        "open_interest": 2,
+        "category": "Sports",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy MagicMock fixtures (kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def sample_market() -> MagicMock:
@@ -70,8 +122,8 @@ def low_volume_market() -> MagicMock:
     m = MagicMock()
     m.ticker = "ILLIQUID-MARKET"
     m.status = "open"
-    m.volume = 10          # below MIN_VOLUME
-    m.open_interest = 5   # below MIN_OPEN_INTEREST
+    m.volume = 10  # below MIN_VOLUME
+    m.open_interest = 5  # below MIN_OPEN_INTEREST
     m.yes_bid = 45
     m.yes_ask = 55
     m.last_price = 50
