@@ -1,13 +1,14 @@
 """Tests for market scanner / filter logic."""
 import pytest
-
 from unittest.mock import MagicMock, AsyncMock
 from app.market_scanner import MarketScanner
 
+
 def make_market(
     ticker="TEST-MARKET",
-    status="open",
-    volume=10000,
+    status="active",
+    volume=0,
+    volume_24h=10000,
     open_interest=500,
     yes_bid=40,
     yes_ask=60,
@@ -19,11 +20,19 @@ def make_market(
     m.ticker = ticker
     m.status = status
     m.volume = volume
+    m.volume_24h = volume_24h
     m.open_interest = open_interest
     m.yes_bid = yes_bid
     m.yes_ask = yes_ask
     m.category = category
     m.close_time = close_time
+    # Also support dict-style access
+    m.get = lambda k, d=None: {
+        "ticker": ticker, "status": status, "volume": volume,
+        "volume_24h": volume_24h, "open_interest": open_interest,
+        "yes_bid": yes_bid, "yes_ask": yes_ask,
+        "category": category, "close_time": close_time,
+    }.get(k, d)
     return m
 
 
@@ -50,26 +59,26 @@ class TestMarketScanner:
 
     @pytest.mark.asyncio
     async def test_scan_filters_closed_markets(self, scanner, mock_kalshi_client):
-        """Closed markets should be excluded from results."""
+        """Inactive markets should be excluded from results."""
         markets = [
-            make_market(ticker="OPEN-1", status="open"),
+            make_market(ticker="ACTIVE-1", status="active"),
             make_market(ticker="CLOSED-1", status="closed"),
-            make_market(ticker="OPEN-2", status="open"),
+            make_market(ticker="ACTIVE-2", status="active"),
         ]
         mock_kalshi_client.get_markets.return_value = markets
         result = await scanner.scan()
         tickers = [m.ticker for m in result]
         assert "CLOSED-1" not in tickers
-        assert "OPEN-1" in tickers
-        assert "OPEN-2" in tickers
+        assert "ACTIVE-1" in tickers
+        assert "ACTIVE-2" in tickers
 
     @pytest.mark.asyncio
     async def test_scan_filters_low_volume(self, scanner, mock_kalshi_client):
         """Markets with zero volume should be excluded."""
         markets = [
-            make_market(ticker="HIGH-VOL", volume=50000),
-            make_market(ticker="ZERO-VOL", volume=0),
-            make_market(ticker="LOW-VOL", volume=10),
+            make_market(ticker="HIGH-VOL", volume_24h=50000),
+            make_market(ticker="ZERO-VOL", volume_24h=0),
+            make_market(ticker="LOW-VOL", volume_24h=10),
         ]
         mock_kalshi_client.get_markets.return_value = markets
         result = await scanner.scan()
@@ -79,17 +88,17 @@ class TestMarketScanner:
 
     @pytest.mark.asyncio
     async def test_scan_returns_sorted_by_volume(self, scanner, mock_kalshi_client):
-        """Results should be sorted by volume descending."""
+        """Results should be sorted by open_interest descending."""
         markets = [
-            make_market(ticker="LOW", volume=100),
-            make_market(ticker="HIGH", volume=100000),
-            make_market(ticker="MED", volume=5000),
+            make_market(ticker="LOW", open_interest=100),
+            make_market(ticker="HIGH", open_interest=100000),
+            make_market(ticker="MED", open_interest=5000),
         ]
         mock_kalshi_client.get_markets.return_value = markets
         result = await scanner.scan()
         if len(result) >= 2:
-            volumes = [m.volume for m in result]
-            assert volumes == sorted(volumes, reverse=True)
+            ois = [m.open_interest for m in result]
+            assert ois == sorted(ois, reverse=True)
 
     @pytest.mark.asyncio
     async def test_scan_handles_api_error(self, scanner, mock_kalshi_client):
