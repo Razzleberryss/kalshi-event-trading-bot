@@ -11,6 +11,7 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
 
@@ -57,7 +58,18 @@ jobs:
         run: |
           pytest tests/ -v --cov=app --cov=executor --cov=clients \
             --cov-report=xml --cov-report=term-missing \
+            --junitxml=pytest-report.xml \
             --asyncio-mode=auto
+
+      - name: Upload pytest diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-diagnostics-py${{ matrix.python-version }}
+          path: |
+            pytest-report.xml
+            coverage.xml
+          if-no-files-found: warn
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
