@@ -10,10 +10,13 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from clients.kalshi_client import AsyncKalshiClient
 from config import TradingMode, config
+
+if TYPE_CHECKING:
+    from storage.async_db_store import AsyncPostgresStore
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,7 @@ class TradeExecutor:
         self._mode = config.mode
         self._cb = CircuitBreakerState()
         self._trades: List[TradeRecord] = []
+        self._account_balance_cents: int = 0
         logger.info("TradeExecutor initialized in %s mode.", self._mode.value)
 
     # ------------------------------------------------------------------
@@ -115,6 +119,29 @@ class TradeExecutor:
             )
             self._trip_circuit_breaker("daily_loss_limit")
             return None
+
+        # --- Account balance based per-trade cap ---
+        worst_loss_per_contract = yes_price if side == "yes" else 100 - yes_price
+        worst_loss_per_contract = max(1, min(99, worst_loss_per_contract))
+        if self._account_balance_cents > 0:
+            max_loss_for_trade = int(
+                self._account_balance_cents * config.max_risk_fraction_per_trade
+            )
+            max_contracts_by_balance = max_loss_for_trade // worst_loss_per_contract
+            if max_contracts_by_balance <= 0:
+                logger.warning(
+                    "Account balance too low to risk any contracts on %s; blocking trade.",
+                    ticker,
+                )
+                return None
+            if count > max_contracts_by_balance:
+                logger.warning(
+                    "Requested count %d exceeds balance-based max %d for %s; capping.",
+                    count,
+                    max_contracts_by_balance,
+                    ticker,
+                )
+                count = max_contracts_by_balance
 
         # --- Order size cap ---
         order_value = count * yes_price
@@ -163,6 +190,31 @@ class TradeExecutor:
         self._cb.daily_pnl_cents += pnl_cents
         if self._cb.daily_pnl_cents <= -config.daily_loss_limit_cents:
             self._trip_circuit_breaker("pnl_update")
+
+    def update_account_balance(self, balance_cents: int) -> None:
+        """Update cached account balance in cents."""
+        if balance_cents < 0:
+            logger.warning("Ignoring negative account balance value: %d", balance_cents)
+            return
+        self._account_balance_cents = balance_cents
+
+    async def sync_daily_pnl_from_store(self, store: "AsyncPostgresStore") -> None:
+        """Initialise daily P&L from persistent storage.
+
+        This is typically called once at startup so that the in-memory
+        circuit breaker state reflects any realised P&L already recorded
+        in the database for the current trading day.
+        """
+        self._cb.reset_if_new_day()
+        try:
+            pnl_cents = await store.get_daily_pnl_cents()
+        except Exception:  # noqa: BLE001
+            logger.error("Failed to sync daily P&L from store; leaving at %d cents.", self._cb.daily_pnl_cents)
+            return
+
+        self._cb.daily_pnl_cents = pnl_cents
+        if self._cb.daily_pnl_cents <= -config.daily_loss_limit_cents:
+            self._trip_circuit_breaker("startup_daily_loss_limit")
 
     # ------------------------------------------------------------------
     # Internal helpers

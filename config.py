@@ -55,6 +55,21 @@ class TradingConfig:
     max_order_size_cents: int = field(
         default_factory=lambda: int(os.getenv("MAX_ORDER_SIZE_CENTS", "1000"))  # $10
     )
+    max_risk_fraction_per_trade: float = field(
+        default_factory=lambda: float(
+            os.getenv("MAX_RISK_FRACTION_PER_TRADE", "0.02")
+        )
+    )
+    max_notional_per_market_cents: int = field(
+        default_factory=lambda: int(
+            os.getenv("MAX_NOTIONAL_PER_MARKET_CENTS", "5000")
+        )
+    )
+    max_notional_per_category_cents: int = field(
+        default_factory=lambda: int(
+            os.getenv("MAX_NOTIONAL_PER_CATEGORY_CENTS", "20000")
+        )
+    )
     daily_loss_limit_cents: int = field(
         default_factory=lambda: int(os.getenv("DAILY_LOSS_LIMIT_CENTS", "5000"))  # $50
     )
@@ -132,6 +147,12 @@ class TradingConfig:
                 raise ValueError("KALSHI_API_SECRET must be set when TRADING_MODE=LIVE")
         if self.max_order_size_cents <= 0:
             raise ValueError("MAX_ORDER_SIZE_CENTS must be positive")
+        if not (0 < self.max_risk_fraction_per_trade < 1):
+            raise ValueError("MAX_RISK_FRACTION_PER_TRADE must be between 0 and 1")
+        if self.max_notional_per_market_cents <= 0:
+            raise ValueError("MAX_NOTIONAL_PER_MARKET_CENTS must be positive")
+        if self.max_notional_per_category_cents <= 0:
+            raise ValueError("MAX_NOTIONAL_PER_CATEGORY_CENTS must be positive")
         if self.daily_loss_limit_cents <= 0:
             raise ValueError("DAILY_LOSS_LIMIT_CENTS must be positive")
         if not (0 < self.min_edge_threshold < 1):

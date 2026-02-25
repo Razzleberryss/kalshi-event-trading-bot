@@ -15,6 +15,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Set
 
+from app.balance_sync import extract_account_balance_cents
 from app.market_scanner import MarketScanner
 from app.strategy import evaluate_market
 from clients.kalshi_client import AsyncKalshiClient
@@ -60,6 +61,11 @@ class EventTradingBot:
 
         # Position tracking: tickers we already hold a position in
         self._open_positions: Set[str] = set()
+        # Exposure tracking (worst-case loss in cents)
+        self._market_exposure_cents: Dict[str, int] = {}
+        self._category_exposure_cents: Dict[str, int] = {}
+        # Account balance used for sizing
+        self._account_balance_cents: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -71,6 +77,11 @@ class EventTradingBot:
         await self._client.open()
         await self._store.connect()
         self._executor = TradeExecutor(self._client)
+        # Initialise circuit breaker P&L state from persisted trades
+        try:
+            await self._executor.sync_daily_pnl_from_store(self._store)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to sync daily P&L from store at startup: %s", exc)
         self._metrics.start_server()
         self._running = True
         logger.info(
@@ -93,6 +104,7 @@ class EventTradingBot:
                 self._ingest_loop(),
                 self._decision_loop(),
                 self._position_sync_loop(),
+                self._balance_sync_loop(),
             )
         except asyncio.CancelledError:
             logger.info("Bot tasks cancelled.")
@@ -147,16 +159,62 @@ class EventTradingBot:
             await asyncio.sleep(config.decision_loop_interval)
             try:
                 positions = await self._client.get_positions()
-                self._open_positions = {
-                    p.get("ticker", "") for p in positions
-                    if p.get("position", 0) != 0
-                }
+                open_positions: Set[str] = set()
+                market_exposure: Dict[str, int] = {}
+                category_exposure: Dict[str, int] = {}
+
+                for pos in positions:
+                    ticker = pos.get("ticker", "")
+                    position = int(pos.get("position", 0) or 0)
+                    if not ticker or position == 0:
+                        continue
+
+                    open_positions.add(ticker)
+                    # Worst-case loss per contract on Kalshi is 100 cents.
+                    worst_loss_cents = abs(position) * 100
+                    market_exposure[ticker] = worst_loss_cents
+
+                    snapshot = self._latest_snapshots.get(ticker, {})
+                    category = snapshot.get("category") or pos.get("category", "")
+                    if category:
+                        category_exposure[category] = (
+                            category_exposure.get(category, 0) + worst_loss_cents
+                        )
+
+                self._open_positions = open_positions
+                self._market_exposure_cents = market_exposure
+                self._category_exposure_cents = category_exposure
+                self._metrics.open_positions.set(len(self._open_positions))
+
                 logger.debug(
                     "Position sync: %d open positions.",
                     len(self._open_positions),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Position sync failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Balance sync loop - keeps account balance current for sizing
+    # ------------------------------------------------------------------
+
+    async def _balance_sync_loop(self) -> None:
+        """Periodically refresh account balance for risk-based sizing."""
+        while self._running:
+            await asyncio.sleep(config.decision_loop_interval)
+            try:
+                balance_payload = await self._client.get_balance()
+                balance_cents = extract_account_balance_cents(balance_payload)
+                if balance_cents < 0:
+                    logger.warning(
+                        "Ignoring negative balance value from API: %d",
+                        balance_cents,
+                    )
+                    continue
+                self._account_balance_cents = balance_cents
+                if self._executor is not None:
+                    self._executor.update_account_balance(balance_cents)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Balance sync failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Decision loop - slower ticker (every M seconds)
@@ -199,6 +257,42 @@ class EventTradingBot:
         yes_price: int = int(signal.get("yes_price", 0))
 
         if yes_price <= 0 or yes_price >= 100:
+            return
+
+        # --- Exposure-based risk checks ---
+        category = snapshot.get("category", "")
+        # Worst-case loss per contract based on side
+        worst_loss_per_contract = yes_price if side == "yes" else 100 - yes_price
+        worst_loss_per_contract = max(1, min(99, worst_loss_per_contract))
+        trade_worst_loss_cents = worst_loss_per_contract  # count=1
+
+        market_exposure = self._market_exposure_cents.get(ticker, 0)
+        category_exposure = self._category_exposure_cents.get(category, 0) if category else 0
+
+        new_market_exposure = market_exposure + trade_worst_loss_cents
+        new_category_exposure = category_exposure + trade_worst_loss_cents
+
+        if new_market_exposure > config.max_notional_per_market_cents:
+            logger.info(
+                "Blocking trade on %s - market exposure limit exceeded "
+                "(current=%d, new=%d, max=%d).",
+                ticker,
+                market_exposure,
+                new_market_exposure,
+                config.max_notional_per_market_cents,
+            )
+            return
+
+        if category and new_category_exposure > config.max_notional_per_category_cents:
+            logger.info(
+                "Blocking trade on %s (category=%s) - category exposure limit exceeded "
+                "(current=%d, new=%d, max=%d).",
+                ticker,
+                category,
+                category_exposure,
+                new_category_exposure,
+                config.max_notional_per_category_cents,
+            )
             return
 
         logger.info(
