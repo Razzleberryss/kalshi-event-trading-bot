@@ -76,9 +76,11 @@ class EventTradingBot:
 
         # Latest raw snapshots keyed by ticker
         self._latest_snapshots: Dict[str, Dict[str, Any]] = {}
+        self._previous_snapshots: Dict[str, Dict[str, Any]] = {}  # For change detection
         self._last_ingest_at: float = 0.0
         self._last_trade_at: float = 0.0
         self._last_alert_at: Dict[str, float] = {}
+        self._no_change_count: int = 0  # Count of consecutive ingests with no changes
 
         # Position tracking: tickers we already hold a position in
         self._open_positions: Set[str] = set()
@@ -187,23 +189,48 @@ class EventTradingBot:
                 markets: List[Dict[str, Any]] = await self._scanner.scan(
                     status="active"
                 )
+
+                # Track if any meaningful changes occurred
+                changes_detected = False
+                new_snapshots: Dict[str, Dict[str, Any]] = {}
+
                 for market in markets:
                     ticker = market.get("ticker", "")
                     if not ticker:
                         continue
                     snapshot = self._scanner.to_snapshot(market)
-                    self._latest_snapshots[ticker] = snapshot
+                    new_snapshots[ticker] = snapshot
+
+                    # Check if this is a new ticker or if prices changed
+                    prev = self._previous_snapshots.get(ticker)
+                    if prev is None or (
+                        prev.get("yes_bid") != snapshot.get("yes_bid")
+                        or prev.get("yes_ask") != snapshot.get("yes_ask")
+                        or prev.get("last_price") != snapshot.get("last_price")
+                    ):
+                        changes_detected = True
+
                     await self._store.log_market_snapshot(
                         ticker, snapshot, raise_on_error=True
                     )
+
+                self._latest_snapshots = new_snapshots
+                self._previous_snapshots = new_snapshots.copy()
+
+                if not changes_detected and len(markets) > 0:
+                    self._no_change_count += 1
+                else:
+                    self._no_change_count = 0
 
                 elapsed = time.monotonic() - t0
                 self._last_ingest_at = time.monotonic()
                 self._metrics.markets_ingested.set(len(markets))
                 logger.debug(
-                    "Ingest: %d active markets cached in %.2fs.",
+                    "Ingest: %d active markets cached in %.2fs (changes=%s, no_change_count=%d).",
                     len(markets),
                     elapsed,
+                    changes_detected,
+                    self._no_change_count,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Ingest loop error: %s", exc)
@@ -211,7 +238,15 @@ class EventTradingBot:
                 self._metrics.errors_total.inc()
                 await self._alerts.post("Kalshi bot ingest loop error", extra={"error": str(exc)})
 
-            await asyncio.sleep(config.market_snapshot_interval)
+            # Adaptive sleep: if no changes detected for 3+ cycles, increase interval by 50%
+            base_interval = config.market_snapshot_interval
+            if self._no_change_count >= 3:
+                sleep_interval = base_interval * 1.5
+                logger.debug("No orderbook changes detected, backing off to %.1fs interval", sleep_interval)
+            else:
+                sleep_interval = base_interval
+
+            await asyncio.sleep(sleep_interval)
 
     # ------------------------------------------------------------------
     # Position sync loop - keeps _open_positions current

@@ -1,6 +1,7 @@
 """clients/kalshi_client.py - Async Kalshi REST API client."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class AsyncKalshiClient:
-    """Async HTTP client for the Kalshi v2 REST API."""
+    """Async HTTP client for the Kalshi v2 REST API with rate limiting."""
 
     def __init__(
         self,
@@ -35,6 +36,8 @@ class AsyncKalshiClient:
         self._client = httpx.AsyncClient(
             base_url=config.kalshi_base_url, timeout=float(config.kalshi_timeout_seconds)
         )
+        # Rate limiting: max 20 concurrent requests
+        self._rate_limiter = asyncio.Semaphore(20)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -97,10 +100,12 @@ class AsyncKalshiClient:
             if cursor:
                 params["cursor"] = cursor
 
-            headers = self._sign("GET", path)
-            resp = await self._client.get(path, params=params, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+            # Rate-limited API call
+            async with self._rate_limiter:
+                headers = self._sign("GET", path)
+                resp = await self._client.get(path, params=params, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
 
             events = data.get("events", [])
 
@@ -131,19 +136,21 @@ class AsyncKalshiClient:
     async def get_positions(self) -> List[Dict[str, Any]]:
         """Fetch current open positions for the account."""
         path = "/portfolio/positions"
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("GET", path)
+            resp = await self._client.get(path, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
         return data.get("market_positions", [])
 
     async def get_balance(self) -> Dict[str, Any]:
         """Fetch current account balance."""
         path = "/portfolio/balance"
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("GET", path)
+            resp = await self._client.get(path, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
 
     # ------------------------------------------------------------------
     # Order management
@@ -192,11 +199,12 @@ class AsyncKalshiClient:
             "yes_price": yes_price,
             "client_order_id": client_order_id or str(uuid.uuid4()),
         }
-        headers = self._sign("POST", path)
-        headers["Content-Type"] = "application/json"
-        resp = await self._client.post(path, json=body, headers=headers)
-        resp.raise_for_status()
-        data: Dict[str, Any] = resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("POST", path)
+            headers["Content-Type"] = "application/json"
+            resp = await self._client.post(path, json=body, headers=headers)
+            resp.raise_for_status()
+            data: Dict[str, Any] = resp.json()
         logger.info(
             "Order placed: %s %s %s x%d @ %d -> order_id=%s",
             action,
@@ -211,10 +219,11 @@ class AsyncKalshiClient:
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """Cancel an open order by order_id."""
         path = f"/portfolio/orders/{order_id}"
-        headers = self._sign("DELETE", path)
-        resp = await self._client.delete(path, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("DELETE", path)
+            resp = await self._client.delete(path, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
 
     async def get_orders(
         self,
@@ -229,7 +238,8 @@ class AsyncKalshiClient:
             params["ticker"] = ticker
         if status:
             params["status"] = status
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, params=params, headers=headers)
-        resp.raise_for_status()
-        return resp.json().get("orders", [])
+        async with self._rate_limiter:
+            headers = self._sign("GET", path)
+            resp = await self._client.get(path, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp.json().get("orders", [])
