@@ -119,6 +119,9 @@ class TradingConfig:
     decision_loop_interval: int = field(
         default_factory=lambda: int(os.getenv("DECISION_LOOP_INTERVAL", "60"))
     )
+    max_concurrent_evaluations: int = field(
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_EVALUATIONS", "10"))
+    )
 
     # ---------------------------------------------------------------------------
     # Database

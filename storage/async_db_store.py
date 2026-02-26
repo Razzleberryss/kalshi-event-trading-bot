@@ -320,3 +320,30 @@ class AsyncPostgresStore:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to save bot state for %s: %s", bot_id, exc)
+
+    async def cleanup_old_snapshots(self, days_to_keep: int = 7) -> int:
+        """Delete market snapshots older than N days to prevent unbounded growth.
+
+        Returns the number of rows deleted.
+        """
+        if not self._pool:
+            logger.warning("cleanup_old_snapshots: pool not initialized")
+            return 0
+
+        try:
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    """
+                    DELETE FROM market_snapshots
+                    WHERE captured_at < NOW() - INTERVAL '%s days'
+                    """,
+                    days_to_keep,
+                )
+                # Parse result like "DELETE 12345"
+                deleted_count = int(result.split()[-1]) if result and result.startswith("DELETE") else 0
+                if deleted_count > 0:
+                    logger.info("Cleaned up %d old market snapshots (older than %d days)", deleted_count, days_to_keep)
+                return deleted_count
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to cleanup old snapshots: %s", exc)
+            return 0

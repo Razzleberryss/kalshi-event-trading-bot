@@ -6,7 +6,9 @@ Enforces daily loss limits, trade count limits, and circuit breakers.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -344,7 +346,19 @@ class TradeExecutor:
                     self._trip_circuit_breaker("consecutive_api_failures")
                     break
 
-                if attempt == max_retries:
-                    break
+                if attempt < max_retries:
+                    # Exponential backoff with jitter: base_delay * 2^(attempt-1) + random jitter
+                    base_delay = 0.5  # 500ms base
+                    backoff_delay = base_delay * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, backoff_delay * 0.3)  # up to 30% jitter
+                    total_delay = backoff_delay + jitter
+                    logger.info(
+                        "Retrying order for %s after %.2fs backoff (attempt %d/%d)",
+                        ticker,
+                        total_delay,
+                        attempt,
+                        max_retries,
+                    )
+                    await asyncio.sleep(total_delay)
 
         return None

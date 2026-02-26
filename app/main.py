@@ -88,6 +88,10 @@ class EventTradingBot:
         # Account balance used for sizing
         self._account_balance_cents: int = 0
 
+        # Bounded concurrency for market evaluation (limit concurrent processing)
+        max_concurrent = max(1, config.max_concurrent_evaluations)
+        self._evaluation_semaphore = asyncio.Semaphore(max_concurrent)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -164,6 +168,7 @@ class EventTradingBot:
                 self._decision_loop(),
                 self._position_sync_loop(),
                 self._balance_sync_loop(),
+                self._cleanup_loop(),
             )
         except asyncio.CancelledError:
             logger.info("Bot tasks cancelled.")
@@ -282,6 +287,22 @@ class EventTradingBot:
                 await self._alerts.post("Kalshi bot balance sync failed", extra={"error": str(exc)})
 
     # ------------------------------------------------------------------
+    # Cleanup loop - daily database maintenance
+    # ------------------------------------------------------------------
+
+    async def _cleanup_loop(self) -> None:
+        """Periodically clean up old database records to prevent unbounded growth."""
+        # Run cleanup once per day (86400 seconds)
+        cleanup_interval = 86400
+        while self._running:
+            await asyncio.sleep(cleanup_interval)
+            try:
+                deleted = await self._store.cleanup_old_snapshots(days_to_keep=7)
+                logger.info("Database cleanup completed: %d old snapshots removed", deleted)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Database cleanup failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Decision loop - slower ticker (every M seconds)
     # ------------------------------------------------------------------
 
@@ -310,6 +331,19 @@ class EventTradingBot:
                     min_interval_seconds=config.stale_snapshot_alert_seconds,
                 )
 
+            # Alert if ingest is running but fetching zero markets
+            if (
+                self._last_ingest_at > 0
+                and len(self._latest_snapshots) == 0
+                and (now - self._last_ingest_at) < config.stale_snapshot_alert_seconds
+            ):
+                await self._maybe_alert(
+                    "zero_markets",
+                    "Kalshi bot is fetching zero markets",
+                    extra={"latest_snapshots": 0},
+                    min_interval_seconds=300,
+                )
+
             if (
                 self._last_trade_at > 0
                 and config.no_trade_alert_seconds > 0
@@ -326,13 +360,25 @@ class EventTradingBot:
                 logger.warning("Decision loop: circuit breaker tripped; skipping trading cycle.")
                 continue
 
-            for ticker, snapshot in list(self._latest_snapshots.items()):
-                await self._evaluate_and_trade(ticker, snapshot)
+            # Evaluate markets concurrently with bounded concurrency
+            tasks = [
+                self._evaluate_and_trade(ticker, snapshot)
+                for ticker, snapshot in list(self._latest_snapshots.items())
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _evaluate_and_trade(
         self, ticker: str, snapshot: Dict[str, Any]
     ) -> None:
         """Run strategy on one snapshot and execute if a signal is generated."""
+        # Bounded concurrency: acquire semaphore before processing
+        async with self._evaluation_semaphore:
+            await self._evaluate_and_trade_impl(ticker, snapshot)
+
+    async def _evaluate_and_trade_impl(
+        self, ticker: str, snapshot: Dict[str, Any]
+    ) -> None:
+        """Internal implementation of market evaluation and trading logic."""
         # Skip if we already hold a position in this market
         if ticker in self._open_positions:
             logger.debug("Skipping %s - already have an open position.", ticker)
@@ -346,8 +392,9 @@ class EventTradingBot:
 
             if config.enable_prediction_model and self._model is not None:
                 event = {"id": ticker, "ticker": ticker, "category": snapshot.get("category", "")}
-                prob, conf, implied, model_latency_s = run_model_once(
-                    self._model, event=event, snapshot=snapshot
+                # Run model prediction in a thread to avoid blocking the async event loop
+                prob, conf, implied, model_latency_s = await asyncio.to_thread(
+                    run_model_once, self._model, event=event, snapshot=snapshot
                 )
                 model_probability = prob
                 model_confidence = conf
@@ -454,8 +501,8 @@ class EventTradingBot:
             self._metrics.update_circuit_breaker(cb_state.is_tripped)
             self._metrics.consecutive_api_failures.set(cb_state.consecutive_failures)
             self._last_trade_at = time.monotonic()
-            # Optimistically add to open positions until next sync
-            self._open_positions.add(ticker)
+            # NOTE: Position will be reflected in next position_sync_loop cycle.
+            # We don't optimistically add to avoid false positives if order fails to fill.
             logger.info("Order logged: %s | %s", record.id, ticker)
         else:
             cb_state = self._executor.get_circuit_breaker_state()

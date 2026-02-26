@@ -78,33 +78,52 @@ class AsyncKalshiClient:
         category: Optional[str] = None,
         **kwargs: Any,
     ) -> List[Any]:
-        """Fetch markets via /events with nested markets for real volume data."""
+        """Fetch markets via /events with nested markets for real volume data.
+
+        Supports pagination to fetch all markets even if count exceeds API limit.
+        """
         path = "/events"
-        params: Dict[str, Any] = {
-            "limit": min(limit, 200),
-            "with_nested_markets": "true",
-        }
-        if category:
-            params["category"] = category
-
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, params=params, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-
-        events = data.get("events", [])
-
-        # Flatten nested markets and attach category from parent event
         all_markets: List[Any] = []
-        for event in events:
-            cat = event.get("category", "")
-            for market in event.get("markets", []):
-                market["category"] = cat
-                all_markets.append(market)
+        cursor: Optional[str] = None
+
+        # Fetch all pages until we have all markets
+        while True:
+            params: Dict[str, Any] = {
+                "limit": min(limit, 200),
+                "with_nested_markets": "true",
+            }
+            if category:
+                params["category"] = category
+            if cursor:
+                params["cursor"] = cursor
+
+            headers = self._sign("GET", path)
+            resp = await self._client.get(path, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+            events = data.get("events", [])
+
+            # Flatten nested markets and attach category from parent event
+            for event in events:
+                cat = event.get("category", "")
+                for market in event.get("markets", []):
+                    market["category"] = cat
+                    all_markets.append(market)
+
+            # Check if there are more pages
+            cursor = data.get("cursor")
+            if not cursor or len(events) < params["limit"]:
+                # No more pages or last page had fewer items than limit
+                break
+
+            # Safety check: limit total markets to prevent infinite loops
+            if len(all_markets) >= limit * 10:  # max 10 pages
+                logger.warning("Pagination safety limit reached, stopping at %d markets", len(all_markets))
+                break
 
         logger.info(
-            "Fetched %d events -> %d markets from Kalshi.",
-            len(events),
+            "Fetched %d markets from Kalshi via pagination.",
             len(all_markets),
         )
         return all_markets
