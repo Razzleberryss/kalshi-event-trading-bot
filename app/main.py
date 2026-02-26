@@ -218,6 +218,7 @@ class EventTradingBot:
                     )
 
                 self._latest_snapshots = new_snapshots
+                # Stores last ingest only (for change detection), not a history
                 self._previous_snapshots = new_snapshots.copy()
 
                 if not changes_detected and len(markets) > 0:
@@ -339,17 +340,16 @@ class EventTradingBot:
 
     async def _cleanup_loop(self) -> None:
         """Periodically clean up old database records to prevent unbounded growth."""
-        # Run cleanup once per day (86400 seconds)
-        cleanup_interval = 86400
+        cleanup_interval = 86400  # Run cleanup once per day (seconds)
         check_interval = 60  # Check shutdown flag every minute
 
-        elapsed = 0
-        while self._running and elapsed < cleanup_interval:
-            await asyncio.sleep(check_interval)
-            elapsed += check_interval
-
-        # Perform cleanup if still running
         while self._running:
+            # Sleep in chunks until the daily interval elapses, allowing fast shutdown
+            elapsed = 0
+            while self._running and elapsed < cleanup_interval:
+                await asyncio.sleep(check_interval)
+                elapsed += check_interval
+
             try:
                 deleted = await self._store.cleanup_old_snapshots(days_to_keep=7)
                 logger.info(
@@ -357,12 +357,6 @@ class EventTradingBot:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Database cleanup failed: %s", exc)
-
-            # Sleep in chunks to allow fast shutdown
-            elapsed = 0
-            while self._running and elapsed < cleanup_interval:
-                await asyncio.sleep(check_interval)
-                elapsed += check_interval
 
     # ------------------------------------------------------------------
     # Decision loop - slower ticker (every M seconds)
@@ -402,7 +396,11 @@ class EventTradingBot:
                 await self._maybe_alert(
                     "zero_markets",
                     "Kalshi bot is fetching zero markets",
-                    extra={"latest_snapshots": 0},
+                    extra={
+                        "latest_snapshots": 0,
+                        "no_change_count": self._no_change_count,
+                        "market_snapshot_interval": config.market_snapshot_interval,
+                    },
                     min_interval_seconds=300,
                 )
 
@@ -435,7 +433,10 @@ class EventTradingBot:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _evaluate_and_trade(self, ticker: str, snapshot: Dict[str, Any]) -> None:
-        """Run strategy on one snapshot and execute if a signal is generated."""
+        """Run strategy on one snapshot and execute if a signal is generated.
+
+        This is the concurrency gate; core logic lives in _evaluate_and_trade_impl.
+        """
         # Bounded concurrency: acquire semaphore before processing
         async with self._evaluation_semaphore:
             await self._evaluate_and_trade_impl(ticker, snapshot)

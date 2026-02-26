@@ -8,7 +8,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -17,6 +17,10 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from config import config
 
 logger = logging.getLogger(__name__)
+
+# Tunable concurrency / pagination limits
+MAX_CONCURRENT_REQUESTS = 20
+MAX_PAGES = 10
 
 
 class AsyncKalshiClient:
@@ -38,8 +42,8 @@ class AsyncKalshiClient:
             base_url=config.kalshi_base_url,
             timeout=float(config.kalshi_timeout_seconds),
         )
-        # Rate limiting: max 20 concurrent requests
-        self._rate_limiter = asyncio.Semaphore(20)
+        # Rate limiting: max MAX_CONCURRENT_REQUESTS concurrent requests
+        self._rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -76,6 +80,42 @@ class AsyncKalshiClient:
     # Market data
     # ------------------------------------------------------------------
 
+    async def _async_paginate(
+        self, path: str, base_params: Dict[str, Any]
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Paginate a GET endpoint, yielding each page's JSON body.
+
+        Manages cursor and limit, enforces a MAX_PAGES safety cap, and wraps
+        rate-limiting and request signing so call-sites don't repeat it.
+        """
+        cursor: Optional[str] = None
+        page_count = 0
+        while True:
+            params = dict(base_params)
+            if cursor:
+                params["cursor"] = cursor
+
+            async with self._rate_limiter:
+                headers = self._sign("GET", path)
+                resp = await self._client.get(path, params=params, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            yield data
+
+            page_count += 1
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+
+            if page_count >= MAX_PAGES:
+                logger.warning(
+                    "Pagination safety cap reached: stopping after %d pages at path %s",
+                    MAX_PAGES,
+                    path,
+                )
+                break
+
     async def get_markets(
         self,
         status: str = "active",
@@ -87,53 +127,27 @@ class AsyncKalshiClient:
 
         Supports pagination to fetch all markets even if count exceeds API limit.
         """
-        path = "/events"
+        base_params: Dict[str, Any] = {
+            "limit": min(limit, 200),
+            "with_nested_markets": "true",
+        }
+        if category:
+            base_params["category"] = category
+
         all_markets: List[Any] = []
-        cursor: Optional[str] = None
-
-        # Fetch all pages until we have all markets
-        while True:
-            params: Dict[str, Any] = {
-                "limit": min(limit, 200),
-                "with_nested_markets": "true",
-            }
-            if category:
-                params["category"] = category
-            if cursor:
-                params["cursor"] = cursor
-
-            # Rate-limited API call
-            async with self._rate_limiter:
-                headers = self._sign("GET", path)
-                resp = await self._client.get(path, params=params, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-
+        total_events = 0
+        async for data in self._async_paginate("/events", base_params):
             events = data.get("events", [])
-
-            # Flatten nested markets and attach category from parent event
+            total_events += len(events)
             for event in events:
                 cat = event.get("category", "")
                 for market in event.get("markets", []):
                     market["category"] = cat
                     all_markets.append(market)
 
-            # Check if there are more pages
-            cursor = data.get("cursor")
-            if not cursor or len(events) < params["limit"]:
-                # No more pages or last page had fewer items than limit
-                break
-
-            # Safety check: limit total markets to prevent infinite loops
-            if len(all_markets) >= limit * 10:  # max 10 pages
-                logger.warning(
-                    "Pagination safety limit reached, stopping at %d markets",
-                    len(all_markets),
-                )
-                break
-
         logger.info(
-            "Fetched %d markets from Kalshi via pagination.",
+            "Fetched %d events -> %d markets (via pagination).",
+            total_events,
             len(all_markets),
         )
         return all_markets
