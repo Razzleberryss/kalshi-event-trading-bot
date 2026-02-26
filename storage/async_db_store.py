@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -72,6 +72,16 @@ CREATE INDEX IF NOT EXISTS idx_orders_ticker ON orders(ticker);
 CREATE INDEX IF NOT EXISTS idx_orders_timestamp ON orders(timestamp);
 CREATE INDEX IF NOT EXISTS idx_snapshots_ticker ON market_snapshots(ticker);
 CREATE INDEX IF NOT EXISTS idx_model_outputs_ticker ON model_outputs(ticker);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    bot_id               TEXT NOT NULL,
+    trading_date         DATE NOT NULL,
+    daily_trades         INTEGER NOT NULL,
+    daily_pnl_cents      INTEGER NOT NULL,
+    is_tripped           BOOLEAN NOT NULL,
+    consecutive_failures INTEGER NOT NULL,
+    PRIMARY KEY (bot_id, trading_date)
+);
 """
 
 
@@ -108,7 +118,7 @@ class AsyncPostgresStore:
     # Write methods
     # ------------------------------------------------------------------
 
-    async def log_trade(self, record: TradeRecord) -> None:
+    async def log_trade(self, record: TradeRecord, *, raise_on_error: bool = False) -> None:
         """Persist a TradeRecord to the orders table."""
         try:
             async with self._pool.acquire() as conn:
@@ -138,9 +148,11 @@ class AsyncPostgresStore:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to log trade %s: %s", record.id, exc)
+            if raise_on_error:
+                raise
 
     async def log_market_snapshot(
-        self, ticker: str, snapshot: Dict[str, Any]
+        self, ticker: str, snapshot: Dict[str, Any], *, raise_on_error: bool = False
     ) -> None:
         """Store a raw market snapshot."""
         try:
@@ -163,6 +175,8 @@ class AsyncPostgresStore:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to log snapshot for %s: %s", ticker, exc)
+            if raise_on_error:
+                raise
 
     async def log_model_output(
         self,
@@ -171,6 +185,8 @@ class AsyncPostgresStore:
         probability: float,
         confidence: float,
         implied_prob: float,
+        *,
+        raise_on_error: bool = False,
     ) -> None:
         """Store a model prediction."""
         edge = probability - implied_prob
@@ -193,9 +209,16 @@ class AsyncPostgresStore:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to log model output for %s: %s", ticker, exc)
+            if raise_on_error:
+                raise
 
     async def log_error(
-        self, source: str, message: str, details: Optional[Dict[str, Any]] = None
+        self,
+        source: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+        *,
+        raise_on_error: bool = False,
     ) -> None:
         """Store an error event for forensic audit."""
         try:
@@ -212,6 +235,8 @@ class AsyncPostgresStore:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to log error from %s: %s", source, exc)
+            if raise_on_error:
+                raise
 
     # ------------------------------------------------------------------
     # Read methods
@@ -241,3 +266,57 @@ class AsyncPostgresStore:
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to fetch recent trades: %s", exc)
             return []
+
+    async def load_bot_state(self, bot_id: str) -> Optional[Dict[str, Any]]:
+        """Load persisted circuit breaker state for the current trading day."""
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT trading_date,
+                           daily_trades,
+                           daily_pnl_cents,
+                           is_tripped,
+                           consecutive_failures
+                    FROM bot_state
+                    WHERE bot_id = $1
+                      AND trading_date = CURRENT_DATE
+                    """,
+                    bot_id,
+                )
+                return dict(row) if row is not None else None
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to load bot state for %s: %s", bot_id, exc)
+            return None
+
+    async def save_bot_state(self, bot_id: str, state: Any) -> None:
+        """Persist circuit breaker state for the current trading day."""
+        trading_date: date = getattr(state, "date", date.today())
+        daily_trades: int = int(getattr(state, "daily_trades", 0))
+        daily_pnl_cents: int = int(getattr(state, "daily_pnl_cents", 0))
+        is_tripped: bool = bool(getattr(state, "is_tripped", False))
+        consecutive_failures: int = int(getattr(state, "consecutive_failures", 0))
+
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO bot_state
+                        (bot_id, trading_date, daily_trades, daily_pnl_cents,
+                         is_tripped, consecutive_failures)
+                    VALUES ($1,$2,$3,$4,$5,$6)
+                    ON CONFLICT (bot_id, trading_date) DO UPDATE
+                    SET daily_trades = EXCLUDED.daily_trades,
+                        daily_pnl_cents = EXCLUDED.daily_pnl_cents,
+                        is_tripped = EXCLUDED.is_tripped,
+                        consecutive_failures = EXCLUDED.consecutive_failures
+                    """,
+                    bot_id,
+                    trading_date,
+                    daily_trades,
+                    daily_pnl_cents,
+                    is_tripped,
+                    consecutive_failures,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to save bot state for %s: %s", bot_id, exc)

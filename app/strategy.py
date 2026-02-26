@@ -15,6 +15,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from app.strategy_modes import ModelContext, ModelGate, StrategyModes
+from config import config
+
 # ---------------------------------------------------------------------------
 # Configuration constants
 # ---------------------------------------------------------------------------
@@ -176,3 +179,60 @@ def evaluate_market(market: Any) -> Optional[Dict[str, Any]]:
         "yes_price": yes_price,
         "score": score,
     }
+
+
+def evaluate_market_with_modes(
+    market: Any,
+    *,
+    modes: Optional[StrategyModes] = None,
+    model_gate: Optional[ModelGate] = None,
+    model: Optional[ModelContext] = None,
+) -> Optional[Dict[str, Any]]:
+    """Evaluate *market* using strategy mode flags and optional model outputs.
+
+    This keeps the legacy `evaluate_market()` behaviour intact, but allows the
+    live bot and backtests to share a single gating path for model-based trades.
+    """
+    modes = modes or StrategyModes(
+        enable_market_making=config.enable_market_making,
+        enable_mispricing=config.enable_mispricing,
+        enable_hedging=config.enable_hedging,
+    )
+    model_gate = model_gate or ModelGate(
+        enabled=config.enable_prediction_model,
+        min_edge_threshold=config.min_edge_threshold,
+        min_confidence=config.min_confidence,
+    )
+    model = model or ModelContext()
+
+    base_signal = evaluate_market(market)
+    if base_signal is None:
+        return None
+
+    # Optional model gating (used in live loop when enabled)
+    if model_gate.enabled:
+        if (
+            model.probability is None
+            or model.confidence is None
+            or model.implied_probability is None
+        ):
+            return None
+
+        edge = model.probability - model.implied_probability
+        if edge <= model_gate.min_edge_threshold:
+            return None
+        if model.confidence < model_gate.min_confidence:
+            return None
+
+        base_signal["model_probability"] = float(model.probability)
+        base_signal["model_confidence"] = float(model.confidence)
+        base_signal["implied_probability"] = float(model.implied_probability)
+        base_signal["edge"] = float(edge)
+
+    # Mode flags currently act as coarse allow/deny switches. More detailed
+    # behaviour (market making / hedging / mispricing) is handled in separate
+    # strategy helpers as the system evolves.
+    if not modes.enable_mispricing:
+        return None
+
+    return base_signal

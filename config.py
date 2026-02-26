@@ -89,6 +89,26 @@ class TradingConfig:
     min_confidence: float = field(
         default_factory=lambda: float(os.getenv("MIN_CONFIDENCE", "0.60"))
     )
+    enable_prediction_model: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_PREDICTION_MODEL", "false").lower()
+        in ("1", "true", "yes", "y", "on")
+    )
+
+    # ---------------------------------------------------------------------------
+    # Strategy modes (enable/disable components)
+    # ---------------------------------------------------------------------------
+    enable_market_making: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_MARKET_MAKING", "false").lower()
+        in ("1", "true", "yes", "y", "on")
+    )
+    enable_mispricing: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_MISPRICING", "true").lower()
+        in ("1", "true", "yes", "y", "on")
+    )
+    enable_hedging: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_HEDGING", "true").lower()
+        in ("1", "true", "yes", "y", "on")
+    )
 
     # ---------------------------------------------------------------------------
     # Poll intervals (seconds)
@@ -129,6 +149,12 @@ class TradingConfig:
         default_factory=lambda: int(
             os.getenv("ALERT_ON_CONSECUTIVE_FAILURES", "3")
         )
+    )
+    stale_snapshot_alert_seconds: int = field(
+        default_factory=lambda: int(os.getenv("STALE_SNAPSHOT_ALERT_SECONDS", "300"))
+    )
+    no_trade_alert_seconds: int = field(
+        default_factory=lambda: int(os.getenv("NO_TRADE_ALERT_SECONDS", "1800"))
     )
 
     # ---------------------------------------------------------------------------

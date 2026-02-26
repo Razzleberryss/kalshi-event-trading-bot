@@ -141,3 +141,65 @@ class TestTradeExecutorPaperMode:
         assert "trades" in summary
         assert "pnl_cents" in summary
         assert "circuit_breaker_tripped" in summary
+
+
+class TestTradeExecutorLiveRetries:
+    def test_live_execute_uses_client_order_id_and_retries(self, executor: TradeExecutor) -> None:
+        """Live execute should retry with same client_order_id on transient errors."""
+        from config import config, TradingMode
+
+        executor._mode = TradingMode.LIVE
+        # Fail first call, succeed second
+        calls = {"n": 0, "client_order_ids": []}
+
+        async def place_order(**kwargs):
+            calls["n"] += 1
+            calls["client_order_ids"].append(kwargs.get("client_order_id"))
+            if calls["n"] == 1:
+                raise Exception("timeout")  # noqa: TRY002
+            return {"order": {"id": "ok"}}
+
+        executor._client.place_order = AsyncMock(side_effect=place_order)
+        original = config.kalshi_max_retries
+        config.kalshi_max_retries = 2
+        try:
+            record = asyncio.run(
+                executor.execute(
+                    ticker="MKT",
+                    side="yes",
+                    action="buy",
+                    count=1,
+                    yes_price=50,
+                )
+            )
+            assert record is not None
+            assert calls["n"] == 2
+            assert calls["client_order_ids"][0] is not None
+            assert calls["client_order_ids"][0] == calls["client_order_ids"][1]
+        finally:
+            config.kalshi_max_retries = original
+
+
+class TestTradeExecutorRiskInvariants:
+    def test_balance_risk_fraction_caps_contracts(self, executor: TradeExecutor) -> None:
+        """Balance-based risk should cap contract count."""
+        from config import config
+
+        executor.update_account_balance(10_000)  # $100
+        original_fraction = config.max_risk_fraction_per_trade
+        config.max_risk_fraction_per_trade = 0.01  # risk $1 max
+        try:
+            record = asyncio.run(
+                executor.execute(
+                    ticker="TEST",
+                    side="yes",
+                    action="buy",
+                    count=100,
+                    yes_price=50,  # worst loss per contract = 50c
+                )
+            )
+            assert record is not None
+            # max_loss_for_trade = 100c; 100 // 50 = 2 contracts
+            assert record.count == 2
+        finally:
+            config.max_risk_fraction_per_trade = original_fraction

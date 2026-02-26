@@ -18,6 +18,10 @@ from config import TradingMode, config
 if TYPE_CHECKING:
     from storage.async_db_store import AsyncPostgresStore
 
+
+class RetryableOrderError(Exception):
+    """Indicates a transient error that should be retried."""
+
 logger = logging.getLogger(__name__)
 
 
@@ -198,6 +202,9 @@ class TradeExecutor:
             return
         self._account_balance_cents = balance_cents
 
+    def is_circuit_breaker_tripped(self) -> bool:
+        return self._cb.is_tripped
+
     async def sync_daily_pnl_from_store(self, store: "AsyncPostgresStore") -> None:
         """Initialise daily P&L from persistent storage.
 
@@ -223,6 +230,27 @@ class TradeExecutor:
     def _trip_circuit_breaker(self, reason: str) -> None:
         self._cb.is_tripped = True
         logger.error("CIRCUIT BREAKER TRIPPED: reason=%s", reason)
+
+    def get_circuit_breaker_state(self) -> CircuitBreakerState:
+        """Return the current circuit breaker state."""
+        return self._cb
+
+    def restore_circuit_breaker_state(
+        self,
+        *,
+        trading_date: Optional[date] = None,
+        daily_trades: int,
+        daily_pnl_cents: int,
+        is_tripped: bool,
+        consecutive_failures: int,
+    ) -> None:
+        """Restore circuit breaker counters from persisted state."""
+        if trading_date is not None:
+            self._cb.date = trading_date
+        self._cb.daily_trades = daily_trades
+        self._cb.daily_pnl_cents = daily_pnl_cents
+        self._cb.is_tripped = is_tripped
+        self._cb.consecutive_failures = consecutive_failures
 
     def _paper_execute(
         self,
@@ -265,35 +293,58 @@ class TradeExecutor:
         implied_probability: float,
         notes: str,
     ) -> Optional[TradeRecord]:
-        """Place a real order via the Kalshi API."""
-        try:
-            resp = await self._client.place_order(
-                ticker=ticker,
-                side=side,
-                action=action,
-                count=count,
-                yes_price=yes_price,
+        """Place a real order via the Kalshi API with retries."""
+        # Deterministic client_order_id for idempotent retries across failures
+        client_order_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{ticker}|{side}|{action}|{count}|{yes_price}|{self._cb.date.isoformat()}",
             )
-            order_id = resp.get("order", {}).get("id", "unknown")
-            self._cb.consecutive_failures = 0
-            return TradeRecord(
-                id=str(uuid.uuid4()),
-                timestamp=datetime.now(tz=timezone.utc),
-                ticker=ticker,
-                side=side,
-                action=action,
-                count=count,
-                price_cents=yes_price,
-                mode="LIVE",
-                order_id=order_id,
-                model_probability=model_probability,
-                model_confidence=model_confidence,
-                implied_probability=implied_probability,
-                notes=notes,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._cb.consecutive_failures += 1
-            logger.error("Live order failed for %s: %s", ticker, exc)
-            if self._cb.consecutive_failures >= config.circuit_breaker_threshold:
-                self._trip_circuit_breaker("consecutive_api_failures")
-            return None
+        )
+
+        max_retries = max(1, config.kalshi_max_retries)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = await self._client.place_order(
+                    ticker=ticker,
+                    side=side,
+                    action=action,
+                    count=count,
+                    yes_price=yes_price,
+                    client_order_id=client_order_id,
+                )
+                order_id = resp.get("order", {}).get("id", "unknown")
+                self._cb.consecutive_failures = 0
+                return TradeRecord(
+                    id=str(uuid.uuid4()),
+                    timestamp=datetime.now(tz=timezone.utc),
+                    ticker=ticker,
+                    side=side,
+                    action=action,
+                    count=count,
+                    price_cents=yes_price,
+                    mode="LIVE",
+                    order_id=order_id,
+                    model_probability=model_probability,
+                    model_confidence=model_confidence,
+                    implied_probability=implied_probability,
+                    notes=notes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._cb.consecutive_failures += 1
+                logger.error(
+                    "Live order attempt %d/%d failed for %s: %s",
+                    attempt,
+                    max_retries,
+                    ticker,
+                    exc,
+                )
+                if self._cb.consecutive_failures >= config.circuit_breaker_threshold:
+                    self._trip_circuit_breaker("consecutive_api_failures")
+                    break
+
+                if attempt == max_retries:
+                    break
+
+        return None

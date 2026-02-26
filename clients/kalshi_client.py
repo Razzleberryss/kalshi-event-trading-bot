@@ -12,9 +12,9 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-logger = logging.getLogger(__name__)
+from config import config
 
-KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+logger = logging.getLogger(__name__)
 
 
 class AsyncKalshiClient:
@@ -27,10 +27,14 @@ class AsyncKalshiClient:
     ) -> None:
         self.api_key = api_key or os.getenv("KALSHI_API_KEY", "")
         raw_secret = api_secret or os.getenv("KALSHI_API_SECRET", "")
-        self._private_key = serialization.load_pem_private_key(
-            raw_secret.encode(), password=None
+        self._private_key = None
+        if raw_secret:
+            self._private_key = serialization.load_pem_private_key(
+                raw_secret.encode(), password=None
+            )
+        self._client = httpx.AsyncClient(
+            base_url=config.kalshi_base_url, timeout=float(config.kalshi_timeout_seconds)
         )
-        self._client = httpx.AsyncClient(base_url=KALSHI_API_BASE, timeout=10.0)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -50,6 +54,10 @@ class AsyncKalshiClient:
     # ------------------------------------------------------------------
 
     def _sign(self, method: str, path: str) -> Dict[str, str]:
+        if not self.api_key or self._private_key is None:
+            raise ValueError(
+                "Kalshi API credentials are not configured (missing key or secret)."
+            )
         ts = str(int(time.time() * 1000))
         msg = (ts + method.upper() + path).encode()
         sig = self._private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())

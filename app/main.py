@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -17,12 +18,17 @@ from typing import Any, Dict, List, Optional, Set
 
 from app.balance_sync import extract_account_balance_cents
 from app.market_scanner import MarketScanner
-from app.strategy import evaluate_market
+from app.strategy import evaluate_market, evaluate_market_with_modes
+from app.strategy_modes import ModelContext
+from app.model_runner import run_model_once
 from clients.kalshi_client import AsyncKalshiClient
 from config import config
 from executor.trade_executor import TradeExecutor
 from monitoring.metrics import BotMetrics
+from monitoring.alerting import AlertingClient
 from storage.async_db_store import AsyncPostgresStore
+from model.example_model import ExampleHeuristicModel
+from model.interface import PredictionModel
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -48,16 +54,31 @@ class EventTradingBot:
       - BotMetrics         : Prometheus counters / gauges
     """
 
-    def __init__(self) -> None:
-        self._client = AsyncKalshiClient()
-        self._scanner = MarketScanner(self._client)
-        self._store = AsyncPostgresStore()
+    def __init__(
+        self,
+        *,
+        client: Optional[AsyncKalshiClient] = None,
+        store: Optional[AsyncPostgresStore] = None,
+        scanner: Optional[MarketScanner] = None,
+        metrics: Optional[BotMetrics] = None,
+        alerts: Optional[AlertingClient] = None,
+        model: Optional[PredictionModel] = None,
+    ) -> None:
+        self._client = client or AsyncKalshiClient()
+        self._scanner = scanner or MarketScanner(self._client)
+        self._store = store or AsyncPostgresStore()
         self._executor: Optional[TradeExecutor] = None
-        self._metrics = BotMetrics()
+        self._metrics = metrics or BotMetrics()
+        self._alerts = alerts or AlertingClient()
         self._running = False
+        self._bot_id = os.getenv("BOT_INSTANCE_ID", "default")
+        self._model: Optional[PredictionModel] = model
 
         # Latest raw snapshots keyed by ticker
         self._latest_snapshots: Dict[str, Dict[str, Any]] = {}
+        self._last_ingest_at: float = 0.0
+        self._last_trade_at: float = 0.0
+        self._last_alert_at: Dict[str, float] = {}
 
         # Position tracking: tickers we already hold a position in
         self._open_positions: Set[str] = set()
@@ -77,9 +98,33 @@ class EventTradingBot:
         await self._client.open()
         await self._store.connect()
         self._executor = TradeExecutor(self._client)
-        # Initialise circuit breaker P&L state from persisted trades
+        if config.enable_prediction_model and self._model is None:
+            self._model = ExampleHeuristicModel()
+            try:
+                self._model.warm_up()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Model warm_up failed: %s", exc)
+        # Restore circuit breaker counters from persisted bot state (per-day)
+        try:
+            state = await self._store.load_bot_state(self._bot_id)
+            if state and self._executor is not None:
+                self._executor.restore_circuit_breaker_state(
+                    trading_date=state.get("trading_date"),
+                    daily_trades=state.get("daily_trades", 0),
+                    daily_pnl_cents=state.get("daily_pnl_cents", 0),
+                    is_tripped=state.get("is_tripped", False),
+                    consecutive_failures=state.get("consecutive_failures", 0),
+                )
+                cb_state = self._executor.get_circuit_breaker_state()
+                self._metrics.update_circuit_breaker(cb_state.is_tripped)
+                self._metrics.consecutive_api_failures.set(cb_state.consecutive_failures)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to restore bot state at startup: %s", exc)
+        # Initialise circuit breaker P&L state from persisted trades (authoritative)
         try:
             await self._executor.sync_daily_pnl_from_store(self._store)
+            cb_state = self._executor.get_circuit_breaker_state()
+            self._metrics.update_circuit_breaker(cb_state.is_tripped)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to sync daily P&L from store at startup: %s", exc)
         self._metrics.start_server()
@@ -92,8 +137,22 @@ class EventTradingBot:
     async def shutdown(self) -> None:
         """Gracefully close all resources."""
         self._running = False
+        if self._executor is not None:
+            try:
+                await self._store.save_bot_state(
+                    self._bot_id, self._executor.get_circuit_breaker_state()
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to persist bot state on shutdown: %s", exc)
+        self._metrics.record_shutdown()
         await self._client.close()
         await self._store.close()
+        await self._alerts.close()
+        if self._model is not None:
+            try:
+                self._model.tear_down()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Model tear_down failed: %s", exc)
         logger.info("EventTradingBot shut down.")
 
     async def run(self) -> None:
@@ -129,9 +188,12 @@ class EventTradingBot:
                         continue
                     snapshot = self._scanner.to_snapshot(market)
                     self._latest_snapshots[ticker] = snapshot
-                    await self._store.log_market_snapshot(ticker, snapshot)
+                    await self._store.log_market_snapshot(
+                        ticker, snapshot, raise_on_error=True
+                    )
 
                 elapsed = time.monotonic() - t0
+                self._last_ingest_at = time.monotonic()
                 self._metrics.markets_ingested.set(len(markets))
                 logger.debug(
                     "Ingest: %d active markets cached in %.2fs.",
@@ -142,6 +204,7 @@ class EventTradingBot:
                 logger.error("Ingest loop error: %s", exc)
                 await self._store.log_error("ingest_loop", str(exc))
                 self._metrics.errors_total.inc()
+                await self._alerts.post("Kalshi bot ingest loop error", extra={"error": str(exc)})
 
             await asyncio.sleep(config.market_snapshot_interval)
 
@@ -192,6 +255,7 @@ class EventTradingBot:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Position sync failed: %s", exc)
+                await self._alerts.post("Kalshi bot position sync failed", extra={"error": str(exc)})
 
     # ------------------------------------------------------------------
     # Balance sync loop - keeps account balance current for sizing
@@ -215,6 +279,7 @@ class EventTradingBot:
                     self._executor.update_account_balance(balance_cents)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Balance sync failed: %s", exc)
+                await self._alerts.post("Kalshi bot balance sync failed", extra={"error": str(exc)})
 
     # ------------------------------------------------------------------
     # Decision loop - slower ticker (every M seconds)
@@ -227,6 +292,38 @@ class EventTradingBot:
 
             if not self._latest_snapshots:
                 logger.debug("Decision loop: no snapshots yet, waiting.")
+                continue
+
+            now = time.monotonic()
+            if (
+                self._last_ingest_at > 0
+                and config.stale_snapshot_alert_seconds > 0
+                and (now - self._last_ingest_at) > config.stale_snapshot_alert_seconds
+            ):
+                await self._maybe_alert(
+                    "stale_snapshots",
+                    "Kalshi bot snapshots are stale",
+                    extra={
+                        "seconds_since_last_ingest": int(now - self._last_ingest_at),
+                        "latest_snapshots": len(self._latest_snapshots),
+                    },
+                    min_interval_seconds=config.stale_snapshot_alert_seconds,
+                )
+
+            if (
+                self._last_trade_at > 0
+                and config.no_trade_alert_seconds > 0
+                and (now - self._last_trade_at) > config.no_trade_alert_seconds
+            ):
+                await self._maybe_alert(
+                    "no_trades",
+                    "Kalshi bot has not traded recently",
+                    extra={"seconds_since_last_trade": int(now - self._last_trade_at)},
+                    min_interval_seconds=config.no_trade_alert_seconds,
+                )
+
+            if self._executor is not None and self._executor.is_circuit_breaker_tripped():
+                logger.warning("Decision loop: circuit breaker tripped; skipping trading cycle.")
                 continue
 
             for ticker, snapshot in list(self._latest_snapshots.items()):
@@ -243,7 +340,37 @@ class EventTradingBot:
 
         # Run the strategy
         try:
-            signal = evaluate_market(snapshot)
+            model_probability = None
+            model_confidence = None
+            implied_probability = None
+
+            if config.enable_prediction_model and self._model is not None:
+                event = {"id": ticker, "ticker": ticker, "category": snapshot.get("category", "")}
+                prob, conf, implied, model_latency_s = run_model_once(
+                    self._model, event=event, snapshot=snapshot
+                )
+                model_probability = prob
+                model_confidence = conf
+                implied_probability = implied
+                self._metrics.model_latency.observe(model_latency_s)
+                if model_probability is not None and model_confidence is not None:
+                    await self._store.log_model_output(
+                        ticker=ticker,
+                        model_name=self._model.name,
+                        probability=float(model_probability),
+                        confidence=float(model_confidence),
+                        implied_prob=float(implied_probability),
+                        raise_on_error=True,
+                    )
+
+            signal = evaluate_market_with_modes(
+                snapshot,
+                model=ModelContext(
+                    probability=model_probability,
+                    confidence=model_confidence,
+                    implied_probability=implied_probability,
+                ),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Strategy error for %s: %s", ticker, exc)
             return
@@ -255,6 +382,9 @@ class EventTradingBot:
         side: str = signal.get("side", "yes")
         action: str = signal.get("action", "buy")
         yes_price: int = int(signal.get("yes_price", 0))
+        model_probability = float(signal.get("model_probability", 0.0) or 0.0)
+        model_confidence = float(signal.get("model_confidence", 0.0) or 0.0)
+        implied_probability = float(signal.get("implied_probability", 0.0) or 0.0)
 
         if yes_price <= 0 or yes_price >= 100:
             return
@@ -311,15 +441,51 @@ class EventTradingBot:
             action=action,
             count=1,
             yes_price=yes_price,
+            model_probability=model_probability,
+            model_confidence=model_confidence,
+            implied_probability=implied_probability,
             notes=f"score={score:.4f}",
         )
 
         if record:
-            await self._store.log_trade(record)
+            await self._store.log_trade(record, raise_on_error=True)
             self._metrics.orders_placed.inc()
+            cb_state = self._executor.get_circuit_breaker_state()
+            self._metrics.update_circuit_breaker(cb_state.is_tripped)
+            self._metrics.consecutive_api_failures.set(cb_state.consecutive_failures)
+            self._last_trade_at = time.monotonic()
             # Optimistically add to open positions until next sync
             self._open_positions.add(ticker)
             logger.info("Order logged: %s | %s", record.id, ticker)
+        else:
+            cb_state = self._executor.get_circuit_breaker_state()
+            self._metrics.update_circuit_breaker(cb_state.is_tripped)
+            self._metrics.consecutive_api_failures.set(cb_state.consecutive_failures)
+            if cb_state.is_tripped:
+                await self._alerts.post(
+                    "Kalshi bot circuit breaker TRIPPED",
+                    extra={
+                        "ticker": ticker,
+                        "consecutive_failures": cb_state.consecutive_failures,
+                        "daily_trades": cb_state.daily_trades,
+                        "daily_pnl_cents": cb_state.daily_pnl_cents,
+                    },
+                )
+
+    async def _maybe_alert(
+        self,
+        key: str,
+        text: str,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        min_interval_seconds: int = 300,
+    ) -> None:
+        now = time.monotonic()
+        last = self._last_alert_at.get(key, 0.0)
+        if (now - last) < float(max(1, min_interval_seconds)):
+            return
+        self._last_alert_at[key] = now
+        await self._alerts.post(text, extra=extra)
 
 
 # ---------------------------------------------------------------------------
