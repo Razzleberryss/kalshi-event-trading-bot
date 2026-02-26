@@ -32,4 +32,3 @@ class AlertingClient:
             resp.raise_for_status()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to send Slack alert: %s", exc)
-

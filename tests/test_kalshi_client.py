@@ -3,6 +3,7 @@
 All network I/O and cryptographic signing is mocked so tests run
 completely offline without real Kalshi credentials.
 """
+
 from __future__ import annotations
 
 import base64
@@ -15,6 +16,7 @@ import httpx
 # ---------------------------------------------------------------------------
 # Helpers - patch load_pem_private_key so __init__ never tries real crypto
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def mock_private_key():
@@ -43,6 +45,7 @@ def client(mock_private_key):
 # _sign
 # ---------------------------------------------------------------------------
 
+
 class TestSign:
     def test_returns_three_headers(self, client):
         headers = client._sign("GET", "/events")
@@ -65,6 +68,7 @@ class TestSign:
 # ---------------------------------------------------------------------------
 # get_markets
 # ---------------------------------------------------------------------------
+
 
 class TestGetMarkets:
     @pytest.mark.asyncio
@@ -138,6 +142,7 @@ class TestGetMarkets:
 # place_order
 # ---------------------------------------------------------------------------
 
+
 class TestPlaceOrder:
     @pytest.mark.asyncio
     async def test_returns_order_dict(self, client):
@@ -182,6 +187,7 @@ class TestPlaceOrder:
 # cancel_order
 # ---------------------------------------------------------------------------
 
+
 class TestCancelOrder:
     @pytest.mark.asyncio
     async def test_calls_delete_with_order_id(self, client):
@@ -200,6 +206,7 @@ class TestCancelOrder:
 # ---------------------------------------------------------------------------
 # get_positions
 # ---------------------------------------------------------------------------
+
 
 class TestGetPositions:
     @pytest.mark.asyncio
@@ -233,6 +240,7 @@ class TestGetPositions:
 # get_balance
 # ---------------------------------------------------------------------------
 
+
 class TestGetBalance:
     @pytest.mark.asyncio
     async def test_returns_balance_dict(self, client):
@@ -248,6 +256,7 @@ class TestGetBalance:
 # ---------------------------------------------------------------------------
 # get_orders
 # ---------------------------------------------------------------------------
+
 
 class TestGetOrders:
     @pytest.mark.asyncio
@@ -279,6 +288,7 @@ class TestGetOrders:
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
+
 
 class TestLifecycle:
     @pytest.mark.asyncio

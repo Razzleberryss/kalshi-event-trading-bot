@@ -31,5 +31,9 @@ def run_model_once(
     latency_s = time.perf_counter() - t0
     prob = pred.get("probability")
     conf = pred.get("confidence")
-    return (float(prob) if prob is not None else None, float(conf) if conf is not None else None, implied_prob, latency_s)
-
+    return (
+        float(prob) if prob is not None else None,
+        float(conf) if conf is not None else None,
+        implied_prob,
+        latency_s,
+    )

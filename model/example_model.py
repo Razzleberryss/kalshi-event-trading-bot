@@ -69,7 +69,9 @@ class ExampleHeuristicModel(PredictionModel):
 
         # --- Confidence: scales with liquidity ---
         # Thin markets -> low confidence; liquid markets -> higher confidence
-        raw_confidence = min(1.0, (volume + open_interest) / self.volume_confidence_scale)
+        raw_confidence = min(
+            1.0, (volume + open_interest) / self.volume_confidence_scale
+        )
         # Clamp to a reasonable range so we don't over-trade thin books
         confidence = 0.30 + 0.50 * raw_confidence  # range: [0.30, 0.80]
 

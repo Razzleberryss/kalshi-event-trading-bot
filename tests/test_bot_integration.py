@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -59,4 +58,3 @@ async def test_bot_places_order_in_paper_mode(monkeypatch):
         assert store.log_trade.await_count in (0, 1)
     finally:
         await bot.shutdown()
-

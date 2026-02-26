@@ -99,8 +99,11 @@ class AsyncPostgresStore:
             max_size=config.db_pool_max_size,
         )
         await self._init_schema()
-        logger.info("AsyncPostgresStore connected (pool min=%d max=%d).",
-                    config.db_pool_min_size, config.db_pool_max_size)
+        logger.info(
+            "AsyncPostgresStore connected (pool min=%d max=%d).",
+            config.db_pool_min_size,
+            config.db_pool_max_size,
+        )
 
     async def close(self) -> None:
         """Close the connection pool."""
@@ -118,7 +121,9 @@ class AsyncPostgresStore:
     # Write methods
     # ------------------------------------------------------------------
 
-    async def log_trade(self, record: TradeRecord, *, raise_on_error: bool = False) -> None:
+    async def log_trade(
+        self, record: TradeRecord, *, raise_on_error: bool = False
+    ) -> None:
         """Persist a TradeRecord to the orders table."""
         try:
             async with self._pool.acquire() as conn:
@@ -335,14 +340,22 @@ class AsyncPostgresStore:
                 result = await conn.execute(
                     """
                     DELETE FROM market_snapshots
-                    WHERE captured_at < NOW() - INTERVAL '%s days'
+                    WHERE captured_at < NOW() - ($1 * INTERVAL '1 day')
                     """,
                     days_to_keep,
                 )
                 # Parse result like "DELETE 12345"
-                deleted_count = int(result.split()[-1]) if result and result.startswith("DELETE") else 0
+                deleted_count = (
+                    int(result.split()[-1])
+                    if result and result.startswith("DELETE")
+                    else 0
+                )
                 if deleted_count > 0:
-                    logger.info("Cleaned up %d old market snapshots (older than %d days)", deleted_count, days_to_keep)
+                    logger.info(
+                        "Cleaned up %d old market snapshots (older than %d days)",
+                        deleted_count,
+                        days_to_keep,
+                    )
                 return deleted_count
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to cleanup old snapshots: %s", exc)

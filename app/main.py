@@ -6,6 +6,7 @@ Starts two concurrent tasks:
 
 Position tracking prevents doubling up on the same market.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +19,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from app.balance_sync import extract_account_balance_cents
 from app.market_scanner import MarketScanner
-from app.strategy import evaluate_market, evaluate_market_with_modes
+from app.strategy import evaluate_market_with_modes
 from app.strategy_modes import ModelContext
 from app.model_runner import run_model_once
 from clients.kalshi_client import AsyncKalshiClient
@@ -123,7 +124,9 @@ class EventTradingBot:
                 )
                 cb_state = self._executor.get_circuit_breaker_state()
                 self._metrics.update_circuit_breaker(cb_state.is_tripped)
-                self._metrics.consecutive_api_failures.set(cb_state.consecutive_failures)
+                self._metrics.consecutive_api_failures.set(
+                    cb_state.consecutive_failures
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to restore bot state at startup: %s", exc)
         # Initialise circuit breaker P&L state from persisted trades (authoritative)
@@ -236,13 +239,18 @@ class EventTradingBot:
                 logger.error("Ingest loop error: %s", exc)
                 await self._store.log_error("ingest_loop", str(exc))
                 self._metrics.errors_total.inc()
-                await self._alerts.post("Kalshi bot ingest loop error", extra={"error": str(exc)})
+                await self._alerts.post(
+                    "Kalshi bot ingest loop error", extra={"error": str(exc)}
+                )
 
             # Adaptive sleep: if no changes detected for 3+ cycles, increase interval by 50%
             base_interval = config.market_snapshot_interval
             if self._no_change_count >= 3:
                 sleep_interval = base_interval * 1.5
-                logger.debug("No orderbook changes detected, backing off to %.1fs interval", sleep_interval)
+                logger.debug(
+                    "No orderbook changes detected, backing off to %.1fs interval",
+                    sleep_interval,
+                )
             else:
                 sleep_interval = base_interval
 
@@ -295,7 +303,9 @@ class EventTradingBot:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Position sync failed: %s", exc)
-                await self._alerts.post("Kalshi bot position sync failed", extra={"error": str(exc)})
+                await self._alerts.post(
+                    "Kalshi bot position sync failed", extra={"error": str(exc)}
+                )
 
     # ------------------------------------------------------------------
     # Balance sync loop - keeps account balance current for sizing
@@ -319,7 +329,9 @@ class EventTradingBot:
                     self._executor.update_account_balance(balance_cents)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Balance sync failed: %s", exc)
-                await self._alerts.post("Kalshi bot balance sync failed", extra={"error": str(exc)})
+                await self._alerts.post(
+                    "Kalshi bot balance sync failed", extra={"error": str(exc)}
+                )
 
     # ------------------------------------------------------------------
     # Cleanup loop - daily database maintenance
@@ -329,13 +341,28 @@ class EventTradingBot:
         """Periodically clean up old database records to prevent unbounded growth."""
         # Run cleanup once per day (86400 seconds)
         cleanup_interval = 86400
+        check_interval = 60  # Check shutdown flag every minute
+
+        elapsed = 0
+        while self._running and elapsed < cleanup_interval:
+            await asyncio.sleep(check_interval)
+            elapsed += check_interval
+
+        # Perform cleanup if still running
         while self._running:
-            await asyncio.sleep(cleanup_interval)
             try:
                 deleted = await self._store.cleanup_old_snapshots(days_to_keep=7)
-                logger.info("Database cleanup completed: %d old snapshots removed", deleted)
+                logger.info(
+                    "Database cleanup completed: %d old snapshots removed", deleted
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Database cleanup failed: %s", exc)
+
+            # Sleep in chunks to allow fast shutdown
+            elapsed = 0
+            while self._running and elapsed < cleanup_interval:
+                await asyncio.sleep(check_interval)
+                elapsed += check_interval
 
     # ------------------------------------------------------------------
     # Decision loop - slower ticker (every M seconds)
@@ -391,8 +418,13 @@ class EventTradingBot:
                     min_interval_seconds=config.no_trade_alert_seconds,
                 )
 
-            if self._executor is not None and self._executor.is_circuit_breaker_tripped():
-                logger.warning("Decision loop: circuit breaker tripped; skipping trading cycle.")
+            if (
+                self._executor is not None
+                and self._executor.is_circuit_breaker_tripped()
+            ):
+                logger.warning(
+                    "Decision loop: circuit breaker tripped; skipping trading cycle."
+                )
                 continue
 
             # Evaluate markets concurrently with bounded concurrency
@@ -402,9 +434,7 @@ class EventTradingBot:
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _evaluate_and_trade(
-        self, ticker: str, snapshot: Dict[str, Any]
-    ) -> None:
+    async def _evaluate_and_trade(self, ticker: str, snapshot: Dict[str, Any]) -> None:
         """Run strategy on one snapshot and execute if a signal is generated."""
         # Bounded concurrency: acquire semaphore before processing
         async with self._evaluation_semaphore:
@@ -426,7 +456,11 @@ class EventTradingBot:
             implied_probability = None
 
             if config.enable_prediction_model and self._model is not None:
-                event = {"id": ticker, "ticker": ticker, "category": snapshot.get("category", "")}
+                event = {
+                    "id": ticker,
+                    "ticker": ticker,
+                    "category": snapshot.get("category", ""),
+                }
                 # Run model prediction in a thread to avoid blocking the async event loop
                 prob, conf, implied, model_latency_s = await asyncio.to_thread(
                     run_model_once, self._model, event=event, snapshot=snapshot
@@ -479,7 +513,9 @@ class EventTradingBot:
         trade_worst_loss_cents = worst_loss_per_contract  # count=1
 
         market_exposure = self._market_exposure_cents.get(ticker, 0)
-        category_exposure = self._category_exposure_cents.get(category, 0) if category else 0
+        category_exposure = (
+            self._category_exposure_cents.get(category, 0) if category else 0
+        )
 
         new_market_exposure = market_exposure + trade_worst_loss_cents
         new_category_exposure = category_exposure + trade_worst_loss_cents
@@ -573,6 +609,7 @@ class EventTradingBot:
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
 
 def _handle_signal(bot: EventTradingBot, loop: asyncio.AbstractEventLoop) -> None:
     logger.info("Shutdown signal received.")

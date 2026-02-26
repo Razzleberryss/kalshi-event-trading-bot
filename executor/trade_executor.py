@@ -24,19 +24,21 @@ if TYPE_CHECKING:
 class RetryableOrderError(Exception):
     """Indicates a transient error that should be retried."""
 
+
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class TradeRecord:
     """Immutable record of a single executed trade."""
+
     id: str
     timestamp: datetime
     ticker: str
-    side: str          # "yes" / "no"
-    action: str        # "buy" / "sell"
+    side: str  # "yes" / "no"
+    action: str  # "buy" / "sell"
     count: int
-    price_cents: int   # fill price in cents
+    price_cents: int  # fill price in cents
     pnl_cents: int = 0
     mode: str = "PAPER"
     order_id: Optional[str] = None
@@ -49,6 +51,7 @@ class TradeRecord:
 @dataclass
 class CircuitBreakerState:
     """Tracks daily risk counters and trip state."""
+
     date: date = field(default_factory=lambda: date.today())
     daily_trades: int = 0
     daily_pnl_cents: int = 0
@@ -162,13 +165,27 @@ class TradeExecutor:
         # --- Route to PAPER or LIVE ---
         if self._mode == TradingMode.PAPER:
             record = self._paper_execute(
-                ticker, side, action, count, yes_price,
-                model_probability, model_confidence, implied_probability, notes,
+                ticker,
+                side,
+                action,
+                count,
+                yes_price,
+                model_probability,
+                model_confidence,
+                implied_probability,
+                notes,
             )
         else:
             record = await self._live_execute(
-                ticker, side, action, count, yes_price,
-                model_probability, model_confidence, implied_probability, notes,
+                ticker,
+                side,
+                action,
+                count,
+                yes_price,
+                model_probability,
+                model_confidence,
+                implied_probability,
+                notes,
             )
 
         if record:
@@ -176,7 +193,12 @@ class TradeExecutor:
             self._trades.append(record)
             logger.info(
                 "Trade executed: %s %s %s x%d @ %d cents (mode=%s)",
-                action, side, ticker, count, yes_price, self._mode.value,
+                action,
+                side,
+                ticker,
+                count,
+                yes_price,
+                self._mode.value,
             )
         return record
 
@@ -218,7 +240,10 @@ class TradeExecutor:
         try:
             pnl_cents = await store.get_daily_pnl_cents()
         except Exception:  # noqa: BLE001
-            logger.error("Failed to sync daily P&L from store; leaving at %d cents.", self._cb.daily_pnl_cents)
+            logger.error(
+                "Failed to sync daily P&L from store; leaving at %d cents.",
+                self._cb.daily_pnl_cents,
+            )
             return
 
         self._cb.daily_pnl_cents = pnl_cents
@@ -267,7 +292,9 @@ class TradeExecutor:
         notes: str,
     ) -> TradeRecord:
         """Simulate order fill using bid/ask mid-price."""
-        logger.debug("[PAPER] Simulating fill: %s %s x%d @ %d", action, ticker, count, yes_price)
+        logger.debug(
+            "[PAPER] Simulating fill: %s %s x%d @ %d", action, ticker, count, yes_price
+        )
         return TradeRecord(
             id=str(uuid.uuid4()),
             timestamp=datetime.now(tz=timezone.utc),

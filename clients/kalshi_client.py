@@ -1,4 +1,5 @@
 """clients/kalshi_client.py - Async Kalshi REST API client."""
+
 from __future__ import annotations
 
 import asyncio
@@ -34,7 +35,8 @@ class AsyncKalshiClient:
                 raw_secret.encode(), password=None
             )
         self._client = httpx.AsyncClient(
-            base_url=config.kalshi_base_url, timeout=float(config.kalshi_timeout_seconds)
+            base_url=config.kalshi_base_url,
+            timeout=float(config.kalshi_timeout_seconds),
         )
         # Rate limiting: max 20 concurrent requests
         self._rate_limiter = asyncio.Semaphore(20)
@@ -124,7 +126,10 @@ class AsyncKalshiClient:
 
             # Safety check: limit total markets to prevent infinite loops
             if len(all_markets) >= limit * 10:  # max 10 pages
-                logger.warning("Pagination safety limit reached, stopping at %d markets", len(all_markets))
+                logger.warning(
+                    "Pagination safety limit reached, stopping at %d markets",
+                    len(all_markets),
+                )
                 break
 
         logger.info(

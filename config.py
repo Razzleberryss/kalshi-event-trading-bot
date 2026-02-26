@@ -23,17 +23,13 @@ class TradingConfig:
     # Runtime mode
     # ---------------------------------------------------------------------------
     mode: TradingMode = field(
-        default_factory=lambda: TradingMode(
-            os.getenv("TRADING_MODE", "PAPER").upper()
-        )
+        default_factory=lambda: TradingMode(os.getenv("TRADING_MODE", "PAPER").upper())
     )
 
     # ---------------------------------------------------------------------------
     # Kalshi API
     # ---------------------------------------------------------------------------
-    kalshi_api_key: str = field(
-        default_factory=lambda: os.getenv("KALSHI_API_KEY", "")
-    )
+    kalshi_api_key: str = field(default_factory=lambda: os.getenv("KALSHI_API_KEY", ""))
     kalshi_api_secret: str = field(
         default_factory=lambda: os.getenv("KALSHI_API_SECRET", "")
     )
@@ -56,14 +52,10 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("MAX_ORDER_SIZE_CENTS", "1000"))  # $10
     )
     max_risk_fraction_per_trade: float = field(
-        default_factory=lambda: float(
-            os.getenv("MAX_RISK_FRACTION_PER_TRADE", "0.02")
-        )
+        default_factory=lambda: float(os.getenv("MAX_RISK_FRACTION_PER_TRADE", "0.02"))
     )
     max_notional_per_market_cents: int = field(
-        default_factory=lambda: int(
-            os.getenv("MAX_NOTIONAL_PER_MARKET_CENTS", "5000")
-        )
+        default_factory=lambda: int(os.getenv("MAX_NOTIONAL_PER_MARKET_CENTS", "5000"))
     )
     max_notional_per_category_cents: int = field(
         default_factory=lambda: int(
@@ -90,24 +82,32 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("MIN_CONFIDENCE", "0.60"))
     )
     enable_prediction_model: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_PREDICTION_MODEL", "false").lower()
-        in ("1", "true", "yes", "y", "on")
+        default_factory=lambda: (
+            os.getenv("ENABLE_PREDICTION_MODEL", "false").lower()
+            in ("1", "true", "yes", "y", "on")
+        )
     )
 
     # ---------------------------------------------------------------------------
     # Strategy modes (enable/disable components)
     # ---------------------------------------------------------------------------
     enable_market_making: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_MARKET_MAKING", "false").lower()
-        in ("1", "true", "yes", "y", "on")
+        default_factory=lambda: (
+            os.getenv("ENABLE_MARKET_MAKING", "false").lower()
+            in ("1", "true", "yes", "y", "on")
+        )
     )
     enable_mispricing: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_MISPRICING", "true").lower()
-        in ("1", "true", "yes", "y", "on")
+        default_factory=lambda: (
+            os.getenv("ENABLE_MISPRICING", "true").lower()
+            in ("1", "true", "yes", "y", "on")
+        )
     )
     enable_hedging: bool = field(
-        default_factory=lambda: os.getenv("ENABLE_HEDGING", "true").lower()
-        in ("1", "true", "yes", "y", "on")
+        default_factory=lambda: (
+            os.getenv("ENABLE_HEDGING", "true").lower()
+            in ("1", "true", "yes", "y", "on")
+        )
     )
 
     # ---------------------------------------------------------------------------
@@ -149,9 +149,7 @@ class TradingConfig:
         default_factory=lambda: os.getenv("SLACK_WEBHOOK_URL", None)
     )
     alert_on_consecutive_failures: int = field(
-        default_factory=lambda: int(
-            os.getenv("ALERT_ON_CONSECUTIVE_FAILURES", "3")
-        )
+        default_factory=lambda: int(os.getenv("ALERT_ON_CONSECUTIVE_FAILURES", "3"))
     )
     stale_snapshot_alert_seconds: int = field(
         default_factory=lambda: int(os.getenv("STALE_SNAPSHOT_ALERT_SECONDS", "300"))

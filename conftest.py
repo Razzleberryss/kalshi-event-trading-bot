@@ -3,6 +3,7 @@
 Adds the project root to sys.path so all packages are importable without
 having to install the package first.
 """
+
 from __future__ import annotations
 
 import sys
@@ -37,6 +38,7 @@ def mock_client() -> AsyncMock:
 # ---------------------------------------------------------------------------
 # Dict-based market fixtures (matches Kalshi /events API response format)
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def liquid_dict_market() -> dict:
@@ -83,6 +85,7 @@ def low_volume_dict_market() -> dict:
 # ---------------------------------------------------------------------------
 # Legacy MagicMock fixtures (kept for backward compatibility)
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def sample_market() -> MagicMock:

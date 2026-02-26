@@ -1,4 +1,5 @@
 """Tests for market scanner / filter logic."""
+
 import pytest
 from unittest.mock import MagicMock, AsyncMock
 from app.market_scanner import MarketScanner
@@ -28,10 +29,15 @@ def make_market(
     m.close_time = close_time
     # Also support dict-style access
     m.get = lambda k, d=None: {
-        "ticker": ticker, "status": status, "volume": volume,
-        "volume_24h": volume_24h, "open_interest": open_interest,
-        "yes_bid": yes_bid, "yes_ask": yes_ask,
-        "category": category, "close_time": close_time,
+        "ticker": ticker,
+        "status": status,
+        "volume": volume,
+        "volume_24h": volume_24h,
+        "open_interest": open_interest,
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "category": category,
+        "close_time": close_time,
     }.get(k, d)
     return m
 
