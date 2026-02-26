@@ -1,6 +1,8 @@
 """clients/kalshi_client.py - Async Kalshi REST API client."""
+
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -18,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class AsyncKalshiClient:
-    """Async HTTP client for the Kalshi v2 REST API."""
+    """Async HTTP client for the Kalshi v2 REST API with rate limiting."""
 
     def __init__(
         self,
@@ -33,8 +35,11 @@ class AsyncKalshiClient:
                 raw_secret.encode(), password=None
             )
         self._client = httpx.AsyncClient(
-            base_url=config.kalshi_base_url, timeout=float(config.kalshi_timeout_seconds)
+            base_url=config.kalshi_base_url,
+            timeout=float(config.kalshi_timeout_seconds),
         )
+        # Rate limiting: max 20 concurrent requests
+        self._rate_limiter = asyncio.Semaphore(20)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -78,33 +83,57 @@ class AsyncKalshiClient:
         category: Optional[str] = None,
         **kwargs: Any,
     ) -> List[Any]:
-        """Fetch markets via /events with nested markets for real volume data."""
+        """Fetch markets via /events with nested markets for real volume data.
+
+        Supports pagination to fetch all markets even if count exceeds API limit.
+        """
         path = "/events"
-        params: Dict[str, Any] = {
-            "limit": min(limit, 200),
-            "with_nested_markets": "true",
-        }
-        if category:
-            params["category"] = category
-
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, params=params, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-
-        events = data.get("events", [])
-
-        # Flatten nested markets and attach category from parent event
         all_markets: List[Any] = []
-        for event in events:
-            cat = event.get("category", "")
-            for market in event.get("markets", []):
-                market["category"] = cat
-                all_markets.append(market)
+        cursor: Optional[str] = None
+
+        # Fetch all pages until we have all markets
+        while True:
+            params: Dict[str, Any] = {
+                "limit": min(limit, 200),
+                "with_nested_markets": "true",
+            }
+            if category:
+                params["category"] = category
+            if cursor:
+                params["cursor"] = cursor
+
+            # Rate-limited API call
+            async with self._rate_limiter:
+                headers = self._sign("GET", path)
+                resp = await self._client.get(path, params=params, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            events = data.get("events", [])
+
+            # Flatten nested markets and attach category from parent event
+            for event in events:
+                cat = event.get("category", "")
+                for market in event.get("markets", []):
+                    market["category"] = cat
+                    all_markets.append(market)
+
+            # Check if there are more pages
+            cursor = data.get("cursor")
+            if not cursor or len(events) < params["limit"]:
+                # No more pages or last page had fewer items than limit
+                break
+
+            # Safety check: limit total markets to prevent infinite loops
+            if len(all_markets) >= limit * 10:  # max 10 pages
+                logger.warning(
+                    "Pagination safety limit reached, stopping at %d markets",
+                    len(all_markets),
+                )
+                break
 
         logger.info(
-            "Fetched %d events -> %d markets from Kalshi.",
-            len(events),
+            "Fetched %d markets from Kalshi via pagination.",
             len(all_markets),
         )
         return all_markets
@@ -112,19 +141,21 @@ class AsyncKalshiClient:
     async def get_positions(self) -> List[Dict[str, Any]]:
         """Fetch current open positions for the account."""
         path = "/portfolio/positions"
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("GET", path)
+            resp = await self._client.get(path, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
         return data.get("market_positions", [])
 
     async def get_balance(self) -> Dict[str, Any]:
         """Fetch current account balance."""
         path = "/portfolio/balance"
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("GET", path)
+            resp = await self._client.get(path, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
 
     # ------------------------------------------------------------------
     # Order management
@@ -173,11 +204,12 @@ class AsyncKalshiClient:
             "yes_price": yes_price,
             "client_order_id": client_order_id or str(uuid.uuid4()),
         }
-        headers = self._sign("POST", path)
-        headers["Content-Type"] = "application/json"
-        resp = await self._client.post(path, json=body, headers=headers)
-        resp.raise_for_status()
-        data: Dict[str, Any] = resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("POST", path)
+            headers["Content-Type"] = "application/json"
+            resp = await self._client.post(path, json=body, headers=headers)
+            resp.raise_for_status()
+            data: Dict[str, Any] = resp.json()
         logger.info(
             "Order placed: %s %s %s x%d @ %d -> order_id=%s",
             action,
@@ -192,10 +224,11 @@ class AsyncKalshiClient:
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """Cancel an open order by order_id."""
         path = f"/portfolio/orders/{order_id}"
-        headers = self._sign("DELETE", path)
-        resp = await self._client.delete(path, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        async with self._rate_limiter:
+            headers = self._sign("DELETE", path)
+            resp = await self._client.delete(path, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
 
     async def get_orders(
         self,
@@ -210,7 +243,8 @@ class AsyncKalshiClient:
             params["ticker"] = ticker
         if status:
             params["status"] = status
-        headers = self._sign("GET", path)
-        resp = await self._client.get(path, params=params, headers=headers)
-        resp.raise_for_status()
-        return resp.json().get("orders", [])
+        async with self._rate_limiter:
+            headers = self._sign("GET", path)
+            resp = await self._client.get(path, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp.json().get("orders", [])

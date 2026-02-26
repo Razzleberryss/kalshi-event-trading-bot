@@ -2,6 +2,7 @@
 Fetches open markets from the Kalshi client, applies liquidity and
 spread filters, and returns a ranked list of tradeable candidates.
 """
+
 from __future__ import annotations
 
 import logging
@@ -13,9 +14,9 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 DEFAULT_LIMIT: int = 200
-MIN_VOLUME: int = 1_000       # minimum 24-h traded contracts
+MIN_VOLUME: int = 1_000  # minimum 24-h traded contracts
 MIN_OPEN_INTEREST: int = 100  # minimum open positions
-MAX_SPREAD_CENTS: int = 20    # yes_ask - yes_bid must be <= this
+MAX_SPREAD_CENTS: int = 20  # yes_ask - yes_bid must be <= this
 
 
 class MarketScanner:
@@ -83,7 +84,8 @@ class MarketScanner:
             return []
 
         candidates = [
-            m for m in markets
+            m
+            for m in markets
             if self._passes_filters(m)
             and (category is None or self._get(m, "category") == category)
         ]

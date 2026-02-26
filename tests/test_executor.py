@@ -29,6 +29,7 @@ class TestCircuitBreakerState:
     def test_reset_on_new_day(self) -> None:
         """Circuit breaker should reset counters on a new day."""
         import datetime
+
         cb = CircuitBreakerState()
         cb.daily_trades = 10
         cb.daily_pnl_cents = -1000
@@ -43,6 +44,7 @@ class TestCircuitBreakerState:
     def test_no_reset_same_day(self) -> None:
         """Circuit breaker should NOT reset if still the same day."""
         import datetime
+
         cb = CircuitBreakerState()
         cb.daily_trades = 5
         cb.date = datetime.date.today()
@@ -67,9 +69,12 @@ class TestTradeExecutorPaperMode:
         assert record.mode == "PAPER"
         assert record.price_cents == 55
 
-    def test_circuit_breaker_blocks_after_max_trades(self, executor: TradeExecutor) -> None:
+    def test_circuit_breaker_blocks_after_max_trades(
+        self, executor: TradeExecutor
+    ) -> None:
         """Executor should block trades after max_daily_trades is exceeded."""
         from config import config
+
         executor._cb.daily_trades = config.max_daily_trades
         record = asyncio.run(
             executor.execute(
@@ -100,6 +105,7 @@ class TestTradeExecutorPaperMode:
     def test_order_size_capped(self, executor: TradeExecutor) -> None:
         """Orders exceeding max size should be capped."""
         from config import config
+
         # Set very low limit to trigger capping
         original_max = config.max_order_size_cents
         config.max_order_size_cents = 100  # 1 dollar
@@ -121,6 +127,7 @@ class TestTradeExecutorPaperMode:
     def test_daily_pnl_trips_circuit_breaker(self, executor: TradeExecutor) -> None:
         """Daily loss exceeding limit should trip the circuit breaker."""
         from config import config
+
         executor._cb.daily_pnl_cents = -(config.daily_loss_limit_cents + 1)
         record = asyncio.run(
             executor.execute(
@@ -144,7 +151,9 @@ class TestTradeExecutorPaperMode:
 
 
 class TestTradeExecutorLiveRetries:
-    def test_live_execute_uses_client_order_id_and_retries(self, executor: TradeExecutor) -> None:
+    def test_live_execute_uses_client_order_id_and_retries(
+        self, executor: TradeExecutor
+    ) -> None:
         """Live execute should retry with same client_order_id on transient errors."""
         from config import config, TradingMode
 
@@ -181,7 +190,9 @@ class TestTradeExecutorLiveRetries:
 
 
 class TestTradeExecutorRiskInvariants:
-    def test_balance_risk_fraction_caps_contracts(self, executor: TradeExecutor) -> None:
+    def test_balance_risk_fraction_caps_contracts(
+        self, executor: TradeExecutor
+    ) -> None:
         """Balance-based risk should cap contract count."""
         from config import config
 

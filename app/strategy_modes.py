@@ -31,4 +31,3 @@ class ModelContext:
     probability: Optional[float] = None
     confidence: Optional[float] = None
     implied_probability: Optional[float] = None
-

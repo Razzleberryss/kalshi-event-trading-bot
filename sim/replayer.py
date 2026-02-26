@@ -87,7 +87,10 @@ class HistoricalReplayer:
 
         logger.info(
             "Starting backtest: %d rows from %s | edge=%.3f conf=%.3f",
-            len(rows), csv_path, self._edge_threshold, self._min_confidence,
+            len(rows),
+            csv_path,
+            self._edge_threshold,
+            self._min_confidence,
         )
 
         result = BacktestResult()
@@ -186,7 +189,7 @@ class HistoricalReplayer:
             pnls = [t.pnl_cents for t in result.trades]
             mean = sum(pnls) / len(pnls)
             variance = sum((x - mean) ** 2 for x in pnls) / len(pnls)
-            std = variance ** 0.5
+            std = variance**0.5
             result.sharpe_ratio = (mean / std) if std > 0 else 0.0
 
         logger.info("Backtest complete: %s", result.summarise())

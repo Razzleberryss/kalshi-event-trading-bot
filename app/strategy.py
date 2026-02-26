@@ -11,6 +11,7 @@ Design goals
 * evaluate_market is the main entry-point for main.py.
 * Supports both dict markets (from API) and object markets.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -22,11 +23,11 @@ from config import config
 # Configuration constants
 # ---------------------------------------------------------------------------
 SCORE_THRESHOLD: float = 0.6  # minimum score (0-1) to generate a trade signal
-MIN_VOLUME: int = 1_000        # contracts traded (24 h)
-MIN_OPEN_INTEREST: int = 100   # open positions
-MAX_SPREAD_CENTS: int = 20     # yes_ask - yes_bid spread ceiling
+MIN_VOLUME: int = 1_000  # contracts traded (24 h)
+MIN_OPEN_INTEREST: int = 100  # open positions
+MAX_SPREAD_CENTS: int = 20  # yes_ask - yes_bid spread ceiling
 UNDERPRICED_THRESHOLD: float = 0.30  # if yes_bid < 30 cents: underpriced YES
-OVERPRICED_THRESHOLD: float = 0.70   # if yes_bid > 70 cents: overpriced YES
+OVERPRICED_THRESHOLD: float = 0.70  # if yes_bid > 70 cents: overpriced YES
 
 
 # ---------------------------------------------------------------------------
@@ -68,8 +69,8 @@ def score_market(market: Any) -> float:
     yes_ask = _get(market, "yes_ask", 0) or 0
 
     # --- Liquidity score (0-40) ---
-    vol_score = min(20, int(volume / 500))          # 10k volume -> 20 pts
-    oi_score = min(20, int(open_interest / 50))     # 1k OI -> 20 pts
+    vol_score = min(20, int(volume / 500))  # 10k volume -> 20 pts
+    oi_score = min(20, int(open_interest / 50))  # 1k OI -> 20 pts
     liquidity_score = vol_score + oi_score
 
     # --- Spread score (0-30): tighter spread earns more points ---

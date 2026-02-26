@@ -16,4 +16,3 @@ def extract_account_balance_cents(balance_payload: Dict[str, Any]) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return 0
-

@@ -6,6 +6,7 @@ Covers:
 - score_market with volume_24h field (from /events endpoint)
 - is_tradeable boundary conditions
 """
+
 from unittest.mock import MagicMock
 
 from app.strategy import (
@@ -20,8 +21,15 @@ from app.strategy import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _liquid_dict(status="active", yes_bid=45, yes_ask=55,
-                 volume_24h=10_000, open_interest=500, ticker="TEST"):
+
+def _liquid_dict(
+    status="active",
+    yes_bid=45,
+    yes_ask=55,
+    volume_24h=10_000,
+    open_interest=500,
+    ticker="TEST",
+):
     """Return a dict market (as returned by the Kalshi API)."""
     return {
         "ticker": ticker,
@@ -33,8 +41,14 @@ def _liquid_dict(status="active", yes_bid=45, yes_ask=55,
     }
 
 
-def _liquid_mock(status="active", yes_bid=45, yes_ask=55,
-                 volume=10_000, open_interest=500, ticker="TEST"):
+def _liquid_mock(
+    status="active",
+    yes_bid=45,
+    yes_ask=55,
+    volume=10_000,
+    open_interest=500,
+    ticker="TEST",
+):
     """Return a MagicMock object market."""
     m = MagicMock()
     m.status = status
@@ -50,6 +64,7 @@ def _liquid_mock(status="active", yes_bid=45, yes_ask=55,
 # ---------------------------------------------------------------------------
 # TestEvaluateMarket
 # ---------------------------------------------------------------------------
+
 
 class TestEvaluateMarket:
     """Tests for evaluate_market function."""
@@ -105,8 +120,10 @@ class TestEvaluateMarket:
         """High-volume, tight-spread active dict market should produce a signal."""
         market = _liquid_dict(
             status="active",
-            yes_bid=46, yes_ask=52,
-            volume_24h=50_000, open_interest=1_000,
+            yes_bid=46,
+            yes_ask=52,
+            volume_24h=50_000,
+            open_interest=1_000,
             ticker="GOOD-MARKET",
         )
         result = evaluate_market(market)
@@ -122,8 +139,10 @@ class TestEvaluateMarket:
         """Dict market: strategy should buy YES when YES is cheap (<30c)."""
         market = _liquid_dict(
             status="active",
-            yes_bid=20, yes_ask=22,
-            volume_24h=50_000, open_interest=1_000,
+            yes_bid=20,
+            yes_ask=22,
+            volume_24h=50_000,
+            open_interest=1_000,
             ticker="CHEAP-YES",
         )
         result = evaluate_market(market)
@@ -135,8 +154,10 @@ class TestEvaluateMarket:
         """Dict market: strategy should buy NO when YES is expensive (>70c)."""
         market = _liquid_dict(
             status="active",
-            yes_bid=78, yes_ask=80,
-            volume_24h=50_000, open_interest=1_000,
+            yes_bid=78,
+            yes_ask=80,
+            volume_24h=50_000,
+            open_interest=1_000,
             ticker="CHEAP-NO",
         )
         result = evaluate_market(market)
@@ -146,16 +167,28 @@ class TestEvaluateMarket:
 
     def test_prefers_yes_when_yes_price_low_obj(self):
         """Object market: strategy should buy YES when YES is cheap."""
-        m = _liquid_mock(status="active", yes_bid=20, yes_ask=22,
-                         volume=50_000, open_interest=1_000, ticker="CHEAP-YES")
+        m = _liquid_mock(
+            status="active",
+            yes_bid=20,
+            yes_ask=22,
+            volume=50_000,
+            open_interest=1_000,
+            ticker="CHEAP-YES",
+        )
         result = evaluate_market(m)
         if result is not None:
             assert result["side"] == "yes"
 
     def test_prefers_no_when_yes_price_high_obj(self):
         """Object market: strategy should buy NO when YES is overpriced."""
-        m = _liquid_mock(status="active", yes_bid=78, yes_ask=80,
-                         volume=50_000, open_interest=1_000, ticker="CHEAP-NO")
+        m = _liquid_mock(
+            status="active",
+            yes_bid=78,
+            yes_ask=80,
+            volume=50_000,
+            open_interest=1_000,
+            ticker="CHEAP-NO",
+        )
         result = evaluate_market(m)
         if result is not None:
             assert result["side"] == "no"
@@ -164,6 +197,7 @@ class TestEvaluateMarket:
 # ---------------------------------------------------------------------------
 # TestScoreMarket
 # ---------------------------------------------------------------------------
+
 
 class TestScoreMarket:
     """Tests for score_market function."""
@@ -194,14 +228,19 @@ class TestScoreMarket:
 
     def test_tight_spread_increases_score(self):
         """Tight bid-ask spread should produce a higher score."""
-        wide = _liquid_dict(yes_bid=30, yes_ask=70, volume_24h=50_000, open_interest=1_000)
-        tight = _liquid_dict(yes_bid=48, yes_ask=52, volume_24h=50_000, open_interest=1_000)
+        wide = _liquid_dict(
+            yes_bid=30, yes_ask=70, volume_24h=50_000, open_interest=1_000
+        )
+        tight = _liquid_dict(
+            yes_bid=48, yes_ask=52, volume_24h=50_000, open_interest=1_000
+        )
         assert score_market(tight) > score_market(wide)
 
 
 # ---------------------------------------------------------------------------
 # TestIsTradeable
 # ---------------------------------------------------------------------------
+
 
 class TestIsTradeable:
     """Tests for is_tradeable function."""
