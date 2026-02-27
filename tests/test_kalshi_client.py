@@ -64,6 +64,40 @@ class TestSign:
         decoded = base64.b64decode(sig)
         assert len(decoded) > 0
 
+    def test_query_string_stripped_from_signed_message(self, client, mock_private_key):
+        """Kalshi requires signing the path without query parameters."""
+        client._sign("GET", "/events?limit=200&with_nested_markets=true")
+
+        signed_msg = mock_private_key.sign.call_args[0][0].decode()
+        assert "?" not in signed_msg
+        assert "limit=200" not in signed_msg
+        assert "with_nested_markets" not in signed_msg
+
+    def test_full_trade_api_path_used_for_signing(self, client, mock_private_key):
+        """The signed string must include /trade-api/v2/events, not just /events."""
+        client._sign("GET", "/events")
+
+        signed_msg = mock_private_key.sign.call_args[0][0].decode()
+        assert "/trade-api/v2/events" in signed_msg
+
+    def test_query_string_stripped_and_full_path_used(self, client, mock_private_key):
+        """Combined: strip query params AND use full /trade-api/v2 prefix."""
+        client._sign("GET", "/events?limit=200&with_nested_markets=true")
+
+        signed_msg = mock_private_key.sign.call_args[0][0].decode()
+        assert "/trade-api/v2/events" in signed_msg
+        assert "?" not in signed_msg
+
+    def test_timestamp_is_milliseconds(self, client, mock_private_key):
+        """KALSHI-ACCESS-TIMESTAMP must be in milliseconds (13-digit integer)."""
+        import time
+        before_ms = int(time.time() * 1000)
+        headers = client._sign("GET", "/events")
+        after_ms = int(time.time() * 1000)
+
+        ts = int(headers["KALSHI-ACCESS-TIMESTAMP"])
+        assert before_ms <= ts <= after_ms
+
 
 # ---------------------------------------------------------------------------
 # get_markets
