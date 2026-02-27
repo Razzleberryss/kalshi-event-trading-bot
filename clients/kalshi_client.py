@@ -9,6 +9,7 @@ import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -63,8 +64,14 @@ class AsyncKalshiClient:
             raise ValueError(
                 "Kalshi API credentials are not configured (missing key or secret)."
             )
+        # Strip query parameters — Kalshi requires signing the path only (no "?...")
+        path_no_query = path.split("?")[0]
+        # Prepend the base path (e.g. /trade-api/v2) so the signed string matches
+        # the full request path as required by Kalshi's authentication spec.
+        base_path = urlparse(config.kalshi_base_url).path.rstrip("/")
+        full_path = base_path + path_no_query
         ts = str(int(time.time() * 1000))
-        msg = (ts + method.upper() + path).encode()
+        msg = (ts + method.upper() + full_path).encode()
         sig = self._private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
         return {
             "KALSHI-ACCESS-KEY": self.api_key,
